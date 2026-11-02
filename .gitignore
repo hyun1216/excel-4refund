@@ -1,0 +1,41 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+~$*
+
+# Runtime and generated data
+logs/
+output/
+outputs/
+temp/
+tmp/
+workspace/
+prepared/
+quarantine/
+packages/
+
+# Company and personal payroll data
+노무_세무 수정신고/
+
+# Local mail/account configuration (contains environment-specific values)
+Resources/Config.xlsx
+
+# Local Codex configuration
+.codex/
+
+# Keep the shared input directory itself in Git.
+# Do not add real employee/payroll data without a separate security review.
+input/*
+!input/.gitkeep
+

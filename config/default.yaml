@@ -1,0 +1,17 @@
+workspace:
+  root: workspace
+policy:
+  min_year: 2000
+  max_year: 2026
+  pdf_dpi: 300
+  image_format: gif
+  allow_partial: false
+  require_supporting_templates: true
+package_groups:
+  nts:
+    name: 국세청제출자료
+    allowed_document_types: [amended_withholding, nts_supporting]
+  agency:
+    name: 공단제출자료
+    allowed_document_types: [submission_ledger, agency_supporting]
+
