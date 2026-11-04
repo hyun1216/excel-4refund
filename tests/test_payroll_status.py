@@ -510,6 +510,8 @@ def test_generates_status_and_updates_detected_years(tmp_path, caplog):
     rows = list(status_book["대상자"].iter_rows(min_row=2, values_only=True))
     first = dict(zip(headers, rows[0]))
     annual = dict(zip(headers, rows[-1]))
+    resident_column = headers.index("주민등록번호") + 1
+    assert status_book["대상자"].cell(2, resident_column).number_format == "@"
     assert first["입사일"] == "2018-03-04"
     assert first["퇴사일"] == "2023-05-06"
     assert annual["입사일"] == "2018-03-04"
@@ -580,8 +582,8 @@ def test_same_name_tax_records_match_annual_rows_by_employee_code(tmp_path):
             for row in sheet.iter_rows(min_row=2, values_only=True)
             if str(row[headers.index("지급년월")] or "").endswith("년합계")
         }
-        assert annual_rows["9001011234567"]["주민등록번호"] == "9001011234567"
-        assert annual_rows["9101011234567"]["주민등록번호"] == "9101011234567"
+        assert annual_rows["9001011234567"]["주민등록번호"] == "900101-1234567"
+        assert annual_rows["9101011234567"]["주민등록번호"] == "910101-1234567"
         assert annual_rows["9001011234567"]["인덱스"] == "1"
         assert annual_rows["9101011234567"]["인덱스"] == "2"
         assert annual_rows["9001011234567"]["근로소득"] == 550_000
@@ -672,7 +674,7 @@ def test_resident_mismatch_does_not_fall_back_to_same_name(tmp_path):
         )
         headers = [cell.value for cell in status["비대상자"][1]]
         values = dict(zip(headers, annual))
-        assert values["주민등록번호"] == "9901011234567"
+        assert values["주민등록번호"] == "990101-1234567"
         assert values["인덱스"] is None
     finally:
         status.close()

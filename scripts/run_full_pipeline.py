@@ -66,7 +66,16 @@ def main() -> int:
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--input-dir", type=Path)
     parser.add_argument("--resume-company-dir", type=Path)
+    parser.add_argument(
+        "--start-stage",
+        type=int,
+        choices=(1, 3),
+        default=1,
+        help="1은 전체 실행, 3은 기존 기초정보·급여대장을 재사용해 직업분류 적재부터 실행합니다.",
+    )
     args = parser.parse_args()
+    if args.start_stage == 3 and args.resume_company_dir is None:
+        parser.error("--start-stage 3에는 --resume-company-dir이 필요합니다.")
     project_root = args.project_root.resolve(strict=True)
     resume_company_directory = args.resume_company_dir
     if resume_company_directory is not None and not resume_company_directory.is_absolute():
@@ -79,6 +88,7 @@ def main() -> int:
             project_root=project_root,
             input_directory=args.input_dir,
             existing_company_directory=resume_company_directory,
+            start_stage=args.start_stage,
         )
     except Exception:
         logging.exception("통합 실행 실패")

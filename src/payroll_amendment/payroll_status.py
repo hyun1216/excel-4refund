@@ -15,7 +15,7 @@ from openpyxl.utils import get_column_letter
 
 from .employment_dates import date_text
 from .errors import SchemaMismatch
-from .infra import safe_name
+from .infra import format_resident_id, safe_name
 
 
 logger = logging.getLogger(__name__)
@@ -917,12 +917,16 @@ def _write_sheet(
         row_fill = total_fill if is_total else target_fill if key in target_months else None
         for column, header in enumerate(headers, 1):
             value = row.get(header, "")
+            if header == "주민등록번호":
+                value = format_resident_id(value)
             cell = sheet.cell(row_index, column, value)
             cell.font = data_red_font if header == NON_TAX_OVERTIME_HEADER else data_font
             cell.border = CELL_BORDER
             cell.alignment = right_alignment if header in money_headers else center_alignment
             if header in money_headers and value not in (None, ""):
                 cell.number_format = MONEY_FORMAT
+            elif header == "주민등록번호":
+                cell.number_format = "@"
             if row_fill is not None:
                 cell.fill = row_fill
 

@@ -92,7 +92,7 @@ class PdfSplitTests(unittest.TestCase):
 
     def test_output_name_matches_existing_brity_rule(self) -> None:
         self.assertEqual(
-            "7_대상7_발행자보관용.pdf",
+            "대상7_발행자보관용_7.pdf",
             _output_name("테스트", 2025, exemption(7)),
         )
 
@@ -123,7 +123,7 @@ class PdfSplitTests(unittest.TestCase):
             )
 
             self.assertEqual(
-                ["1_대상1_발행자보관용.pdf", "2_대상2_발행자보관용.pdf"],
+                ["대상1_발행자보관용_1.pdf", "대상2_발행자보관용_2.pdf"],
                 [path.name for path in result.output_files],
             )
             self.assertTrue(all(len(PdfReader(str(path)).pages) == 2 for path in result.output_files))
@@ -160,7 +160,7 @@ class PdfSplitTests(unittest.TestCase):
                 )
             self.assertEqual([3, 2], [len(PdfReader(str(path)).pages) for path in result.output_files])
             self.assertEqual(
-                ["1_대상1_발행자보관용.pdf", "2_대상2_발행자보관용.pdf"],
+                ["대상1_발행자보관용_1.pdf", "대상2_발행자보관용_2.pdf"],
                 [path.name for path in result.output_files],
             )
             manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
@@ -193,7 +193,7 @@ class PdfSplitTests(unittest.TestCase):
                 )
             self.assertEqual(1, len(result.output_files))
             self.assertEqual(
-                "1_대상1_발행자보관용.pdf",
+                "대상1_발행자보관용_1.pdf",
                 result.output_files[0].name,
             )
             self.assertEqual(2, len(PdfReader(str(result.output_files[0])).pages))

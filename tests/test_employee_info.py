@@ -17,7 +17,7 @@ class EmployeeInfoTests(unittest.TestCase):
             root = Path(folder)
             basic_path = root / "회사_기초정보.xlsx"
             raw_path = root / "근로자고용정보현황조회.xlsx"
-            mapped_path = root / "근로자고용정보현황조회_직업분류매핑결과.xlsx"
+            mapped_path = root / "수정본_직업분류매핑결과.xlsx"
             linkage_path = root / "직업분류_연계표.xlsx"
 
             basic = Workbook()

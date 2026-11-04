@@ -4,7 +4,10 @@ import shutil
 
 from openpyxl import Workbook, load_workbook
 
-from payroll_amendment.correction_inputs import prepare_correction_inputs
+from payroll_amendment.correction_inputs import (
+    _append_tax_reduction_review_issue,
+    prepare_correction_inputs,
+)
 
 
 def _make_basic(path: Path) -> None:
@@ -21,10 +24,12 @@ def _make_basic(path: Path) -> None:
         "기간", "사원번호", "성명", "주민등록번호", "인덱스",
         "과세소득_총계", "비과세소득_총계", "과세소득_현계", "비과세소득_현계",
         "결정세액_소득세", "야간근로수당_총계", "야간근로수당_현계",
+        "조특법 감면율", "산출세액", "세액감면 계", "근로소득", "세액공제 계",
     ])
     tax.append([
         2023, "9001011234567", "홍길동", "9001011234567", 7,
         10_000_000, 200_000, 10_000_000, 200_000, 100_000, 200_000, 200_000,
+        None, 2_500_000, 2_000_000, 500_000, 500_000,
     ])
     workbook.save(path)
     workbook.close()
@@ -96,15 +101,35 @@ def _make_tool(path: Path) -> None:
     previous.title = "prevData"
     headers = [
         "기간", "연번", "사번", "이름", "주민등록번호", "인덱스",
-        "18-1.생산직등야간근로수당", "과세소득_총계", "비과세소득_총계",
+        "18-1.생산직등야간근로수당", "조특법 감면율",
+        "감면소득_현계", "감면소득_총계", "과세소득_총계", "비과세소득_총계",
         "과세소득_현계", "비과세소득_현계", "결정세액_소득세",
-        "비과세명1_총", "코드1_총", "금액1_총",
+        "기납부세액_소득세", "차감징수세액_소득세", "결정세액_지방세",
+        "기납부세액_지방세", "차감징수세액_지방세", "근로소득금액",
+        "차감소득금액", "그밖의소득공제계", "과세표준", "세액감면 계",
+        "근로소득", "세액공제 계", "비과세명1_총", "코드1_총", "금액1_총",
         "비과세명1_현", "코드1_현", "금액1_현",
     ]
     previous.append(headers)
     data = workbook.create_sheet("Data")
-    data.append(headers)
-    data.append([None] * 6 + ["=prevData!G2"] + [None] * (len(headers) - 7))
+    data_headers = [
+        *headers[:8], "급여_현계", "급여_총계", "과세소득_현계", "과세소득_총계",
+        "비과세소득_현계", "비과세소득_총계", "감면소득_현계", "감면소득_총계",
+        "결정세액_소득세", "결정세액_지방세", "기납부세액_소득세",
+        "기납부세액_지방세", "차감징수세액_소득세", "차감징수세액_지방세",
+        "총급여", "근로소득공제", "근로소득금액", "차감소득(역산)",
+        "차감소득금액", "그밖의소득공제계", "과세표준", "산출세액",
+        "조특법 제30조", "세액감면 계", "근로소득", "세액공제(기타)",
+        "세액공제 계", "결정세액",
+    ]
+    data.append(data_headers)
+    formulas = [None] * len(data_headers)
+    formulas[6] = "=prevData!G2"
+    formulas[7] = "=prevData!H2"
+    formulas[29] = "=1000000"
+    formulas[30] = "=IF(H2>0,AD2*H2,0)"
+    formulas[31] = "=AE2"
+    data.append(formulas)
     workbook.create_sheet("Form")
     workbook.create_sheet("TaxTable")
     workbook.save(path)
@@ -143,12 +168,15 @@ def test_prepares_modified_status_tools_and_monthly_ledgers(tmp_path, caplog):
     assert tool_book["prevData"]["A2"].value == "2023년"
     assert tool_book["prevData"]["D2"].value == "홍길동"
     assert tool_book["prevData"]["G2"].value == 100_000
-    assert tool_book["prevData"]["H2"].value == 10_000_000
-    assert tool_book["prevData"]["M2"].value == "야간근로수당"
-    assert tool_book["prevData"]["N2"].value == "O01"
+    assert tool_book["prevData"]["K2"].value == 10_000_000
+    assert tool_book["prevData"]["Y2"].value == 2_000_000
+    assert tool_book["prevData"]["AB2"].value == "야간근로수당"
+    assert tool_book["prevData"]["AC2"].value == "O01"
     assert tool_book["Data"]["A2"].value == "2023년"
     assert tool_book["Data"]["G2"].value == "=prevData!G2"
+    assert tool_book["Data"]["AF2"].value == "=MAX(0,MIN(AD2,IF(N(H2)>0,AE2,N(prevData!Y2))))"
     tool_book.close()
+    assert any(issue["type"] == "세액감면 수동 검토" for issue in result.issues)
     assert len(result.monthly_payroll_files) == 12
 
     january = correction_root / "테스트_23년01월_급여대장.xls"
@@ -182,3 +210,25 @@ def test_prepares_modified_status_tools_and_monthly_ledgers(tmp_path, caplog):
     assert february_book["Sheet1"]["D2"].value is None
     assert february_book["Sheet1"]["E2"].value is None
     february_book.close()
+
+
+def test_tax_reduction_review_distinguishes_rate_and_limit_cases():
+    target = {"사원번호": "1", "성명": "홍길동"}
+
+    issues: list[dict[str, object]] = []
+    _append_tax_reduction_review_issue(
+        issues=issues,
+        year=2023,
+        target=target,
+        tax={"조특법 감면율": 0.7, "산출세액": 1_000_000, "세액감면 계": 700_000},
+    )
+    assert issues == []
+
+    _append_tax_reduction_review_issue(
+        issues=issues,
+        year=2023,
+        target=target,
+        tax={"조특법 감면율": "70%", "산출세액": 3_000_000, "세액감면 계": 2_000_000},
+    )
+    assert issues[-1]["type"] == "세액감면 수동 검토"
+    assert "한도 적용 여부" in str(issues[-1]["reason"])

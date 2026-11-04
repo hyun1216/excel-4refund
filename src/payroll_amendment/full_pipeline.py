@@ -30,7 +30,11 @@ class FullPipelineResult:
     correction_inputs: CorrectionInputResult
 
 
-def _load_existing_intake(company_directory: Path) -> IntakeResult:
+def _load_existing_intake(
+    company_directory: Path,
+    *,
+    validate_moved_files: bool = True,
+) -> IntakeResult:
     company_root = Path(company_directory).resolve(strict=True)
     report_path = company_root / "1. 급상여현황 생성" / "input_접수보고서.json"
     if not report_path.is_file():
@@ -38,7 +42,7 @@ def _load_existing_intake(company_directory: Path) -> IntakeResult:
     report = json.loads(report_path.read_text(encoding="utf-8-sig"))
     moved_files = tuple(Path(item["destination"]) for item in report.get("moved_files", []))
     missing = [path for path in moved_files if not path.is_file()]
-    if missing:
+    if validate_moved_files and missing:
         raise SchemaMismatch(
             "기존 접수 파일이 누락됐습니다: " + ", ".join(path.name for path in missing)
         )
@@ -57,9 +61,14 @@ def run_full_pipeline(
     project_root: Path,
     input_directory: Path | None = None,
     existing_company_directory: Path | None = None,
+    start_stage: int = 1,
 ) -> FullPipelineResult:
+    if start_stage not in (1, 3):
+        raise ValueError("start_stage는 1 또는 3이어야 합니다.")
+    if start_stage == 3 and existing_company_directory is None:
+        raise ValueError("3단계 재개에는 existing_company_directory가 필요합니다.")
+
     root = Path(project_root).resolve(strict=True)
-    input_root = Path(input_directory or root / "input").resolve(strict=True)
     resources = root / "Resources"
     template = resources / "Template" / "Temp_기초정보.xlsx"
     withholding_tool_template = resources / "Template" / "Temp_수정 원천징수영수증 생성 Tool.xlsx"
@@ -73,39 +82,67 @@ def run_full_pipeline(
             raise SchemaMismatch(f"통합 실행 필수 리소스가 없습니다: {required}")
 
     if existing_company_directory is None:
+        input_root = Path(input_directory or root / "input").resolve(strict=True)
         logger.info("전체 실행 [1/7] 입력 접수 및 거래처 폴더 생성 시작")
         intake = organize_input_batch(input_directory=input_root, project_root=root)
         logger.info("전체 실행 [1/7] 완료: %s", intake.company_name)
     else:
         logger.info("전체 실행 [1/7] 기존 입력 재개 시작")
-        intake = _load_existing_intake(existing_company_directory)
+        intake = _load_existing_intake(
+            existing_company_directory,
+            validate_moved_files=start_stage == 1,
+        )
         logger.info("전체 실행 [1/7] 기존 입력 재개 완료: %s", intake.company_name)
     company_root = intake.company_directory
-    source_input = company_root / "1. 급상여현황 생성" / "1.Input"
-    logger.info("전체 실행 [2/7] 원천징수 분할·추출 및 기초정보·급여대장 생성 시작")
-    conversion = PayrollConverter().convert_company_input(
-        input_root=source_input,
-        output_directory=company_root,
-        basic_info_template=template,
-    )
-    logger.info("전체 실행 [2/7] 완료: 엑셀 %d개", len(conversion.output_files))
-
-    basic_files = [
-        path for path in conversion.output_files
-        if path.name.endswith("_기초정보.xlsx")
-    ]
-    payroll_outputs = [
-        path for path in conversion.output_files
-        if path.name.endswith("년 급여대장.xlsx")
-    ]
+    if start_stage == 1:
+        source_input = company_root / "1. 급상여현황 생성" / "1.Input"
+        logger.info("전체 실행 [2/7] 원천징수 분할·추출 및 기초정보·급여대장 생성 시작")
+        conversion = PayrollConverter().convert_company_input(
+            input_root=source_input,
+            output_directory=company_root,
+            basic_info_template=template,
+        )
+        logger.info("전체 실행 [2/7] 완료: 엑셀 %d개", len(conversion.output_files))
+        basic_files = [
+            path for path in conversion.output_files
+            if path.name.endswith("_기초정보.xlsx")
+        ]
+        payroll_outputs = [
+            path for path in conversion.output_files
+            if path.name.endswith("년 급여대장.xlsx")
+        ]
+    else:
+        logger.info("전체 실행 [1/7~2/7] 기존 산출물 재사용")
+        basic_files = sorted(
+            path for path in company_root.glob("*_기초정보.xlsx")
+            if not path.name.startswith("~$")
+        )
+        payroll_outputs = sorted(
+            path for path in company_root.glob("*년 급여대장.xlsx")
+            if not path.name.startswith("~$")
+        )
+        conversion_report = company_root / "trans_검증보고서.json"
+        if not conversion_report.is_file():
+            raise SchemaMismatch(f"기존 변환 검증보고서가 없습니다: {conversion_report}")
+        conversion = UniversalConversionResult(
+            company_root,
+            tuple((*basic_files, *payroll_outputs)),
+            conversion_report,
+        )
     if len(basic_files) != 1:
         raise SchemaMismatch(f"기초정보 결과가 {len(basic_files)}개입니다: {company_root}")
-    if not payroll_outputs:
+    if start_stage == 1 and not payroll_outputs:
         raise SchemaMismatch(f"연도별 급여대장 결과가 없습니다: {company_root}")
 
     basic_info = basic_files[0]
     logger.info("전체 실행 [3/7] 직업분류코드 및 건보정보 적재 시작")
     employment_info, health_roster = discover_employee_info_sources(company_root)
+    if start_stage == 3 and (
+        employment_info is None or "직업분류매핑결과" not in employment_info.name
+    ):
+        raise SchemaMismatch(
+            f"파일명에 '직업분류매핑결과'가 포함된 엑셀 파일이 없습니다: {company_root}"
+        )
     employee_info = populate_basic_info_employee_sheets(
         basic_info_path=basic_info,
         employment_info_path=employment_info,
@@ -122,16 +159,25 @@ def run_full_pipeline(
     payroll_input = company_root / "2.근로소득 수정신고" / "1.Input"
     payroll_input.mkdir(parents=True, exist_ok=True)
     payroll_files: list[Path] = []
-    logger.info("전체 실행 [4/7] 파일 이동 시작 (총 %d개)", len(payroll_outputs))
-    try:
-        for source in payroll_outputs:
-            destination = payroll_input / source.name
-            os.replace(source, destination)
-            payroll_files.append(destination)
-    except Exception as exc:
-        logger.error("전체 실행 [4/7] 파일 이동 오류: %s", exc)
-        raise
-    logger.info("전체 실행 [4/7] 파일 이동 완료: %d개", len(payroll_files))
+    if payroll_outputs:
+        logger.info("전체 실행 [4/7] 파일 이동 시작 (총 %d개)", len(payroll_outputs))
+        try:
+            for source in payroll_outputs:
+                destination = payroll_input / source.name
+                os.replace(source, destination)
+                payroll_files.append(destination)
+        except Exception as exc:
+            logger.error("전체 실행 [4/7] 파일 이동 오류: %s", exc)
+            raise
+        logger.info("전체 실행 [4/7] 파일 이동 완료: %d개", len(payroll_files))
+    else:
+        payroll_files = sorted(
+            path for path in payroll_input.glob("*년 급여대장.xlsx")
+            if not path.name.startswith("~$")
+        )
+        if not payroll_files:
+            raise SchemaMismatch(f"기존 연도별 급여대장이 없습니다: {payroll_input}")
+        logger.info("전체 실행 [4/7] 기존 급여대장 재사용: %d개", len(payroll_files))
 
     logger.info("전체 실행 [5/7] 급상여현황 생성 시작")
     payroll_status = generate_company_payroll_status(company_root, resources)
@@ -159,6 +205,7 @@ def run_full_pipeline(
         "company_name": intake.company_name,
         "company_id": intake.company_id,
         "company_directory": str(company_root),
+        "start_stage": start_stage,
         "intake_report": str(intake.report_path),
         "conversion_report": str(conversion.report_path),
         "basic_info": str(basic_info),

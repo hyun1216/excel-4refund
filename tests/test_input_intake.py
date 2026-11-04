@@ -135,3 +135,33 @@ def test_organizes_nested_year_folders_and_keeps_direct_input_supported(tmp_path
     relative_sources = {item["source_relative"] for item in report["moved_files"]}
     assert str(Path("원천징수영수증") / "2023년" / receipt.name) in relative_sources
     assert str(Path("급여대장") / "23년" / nested_payroll.name) in relative_sources
+
+
+def test_organizes_dated_payroll_pdf_from_year_folder(tmp_path):
+    project = tmp_path / "project"
+    inbox = project / "input"
+    payroll = inbox / "2023" / "202301(2. 급여 + 상여)[20230125].pdf"
+    payroll.parent.mkdir(parents=True)
+    payroll.write_bytes(b"test payroll")
+    receipt = inbox / "2023년 원천징수영수증.pdf"
+    receipt.write_bytes(b"test receipt")
+
+    def classify(path: Path) -> str:
+        if path == receipt:
+            return "withholding_receipt"
+        from payroll_amendment.dawon_pipeline import _parse_payroll_name
+
+        _parse_payroll_name(path)
+        return "tabular_payroll"
+
+    result = organize_input_batch(
+        input_directory=inbox,
+        project_root=project,
+        pdf_classifier=classify,
+        company_metadata_reader=lambda _: ("주식회사 테스트", "123-45-67890"),
+    )
+
+    moved = {path.name: path for path in result.moved_files}
+    assert moved[payroll.name].parent.name == "23년"
+    assert moved[payroll.name].parent.parent.name == "급여대장"
+    assert not result.unknown_files

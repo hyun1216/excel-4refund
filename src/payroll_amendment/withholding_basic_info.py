@@ -13,7 +13,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader
 
 from .errors import PdfToExcelError, SchemaMismatch
-from .infra import sha256
+from .infra import format_resident_id, sha256
 from .withholding_pdf_excel import WithholdingPdfData, extract_withholding_pdf
 
 
@@ -135,7 +135,7 @@ def _record(data: WithholdingPdfData, employee_id: str) -> dict[str, object]:
     values["기간"] = data.values.get("기간")
     values["사원번호"] = employee_id
     values["성명"] = data.employee_name
-    values["주민등록번호"] = data.resident_id
+    values["주민등록번호"] = format_resident_id(data.resident_id)
     values["인덱스"] = data.pdf_index
     return values
 

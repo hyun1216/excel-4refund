@@ -14,7 +14,7 @@ from openpyxl.utils import get_column_letter
 import pdfplumber
 
 from .errors import PdfToExcelError, SchemaMismatch
-from .infra import sha256
+from .infra import format_resident_id, sha256
 
 
 BASE_HEADERS = (
@@ -269,7 +269,14 @@ def _write_month_sheet(worksheet: Any, rows: list[dict[str, int | str]]) -> None
     worksheet.sheet_view.showGridLines = False
     worksheet.append(BASE_HEADERS)
     for record in rows:
-        worksheet.append([None if record.get(header) == 0 else record.get(header) for header in BASE_HEADERS])
+        worksheet.append(
+            [
+                format_resident_id(record.get(header))
+                if header == "주민등록번호"
+                else None if record.get(header) == 0 else record.get(header)
+                for header in BASE_HEADERS
+            ]
+        )
     worksheet.freeze_panes = "E2"
     worksheet.auto_filter.ref = f"A1:{get_column_letter(len(BASE_HEADERS))}{max(1, len(rows) + 1)}"
     for cell in worksheet[1]:

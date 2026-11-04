@@ -30,7 +30,7 @@ from .employee_info import (
     discover_employee_info_sources,
     populate_basic_info_employee_sheets,
 )
-from .infra import sha256
+from .infra import format_resident_id, sha256
 from .pdf_split import archive_prepared_withholding_pdfs, inspect_withholding_pdf
 from .withholding_basic_info import (
     _extract_all,
@@ -1141,6 +1141,8 @@ class PayrollConverter:
                 for header, value in zip(headers, record):
                     if pd.isna(value) or (header not in IDENTITY_HEADERS and value == 0):
                         value = None
+                    elif header == "주민등록번호":
+                        value = format_resident_id(value)
                     values.append(value)
                 worksheet.append(values)
             worksheet.freeze_panes = "E2"

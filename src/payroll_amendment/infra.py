@@ -13,6 +13,22 @@ from zoneinfo import ZoneInfo
 SEOUL = ZoneInfo("Asia/Seoul")
 
 
+def format_resident_id(value: object) -> str:
+    """주민등록번호를 Excel용 하이픈 포함 텍스트로 정규화한다."""
+    if value in (None, ""):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        text = str(int(value))
+    else:
+        text = str(value).strip()
+    compact = re.sub(r"[\s-]", "", text)
+    if compact.isdigit() and len(compact) == 12:
+        compact = compact.zfill(13)
+    if len(compact) == 13 and compact[:6].isdigit():
+        return f"{compact[:6]}-{compact[6:]}"
+    return text
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:

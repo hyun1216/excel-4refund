@@ -30,7 +30,7 @@ import pdfplumber
 
 from .errors import PdfToExcelError
 
-from .infra import safe_name, sha256
+from .infra import format_resident_id, safe_name, sha256
 
 from .models import TaxExemption
 
@@ -272,6 +272,16 @@ def _largest_table(page: PageTables, keyword: str) -> Table:
             for table in page
             if any("소득자" in _compact(cell) for row in table for cell in row)
             and any("주(현)" == _compact(cell) for row in table for cell in row)
+        ]
+    if not candidates and keyword == "정산명세":
+        required = ("근로소득금액", "종합소득과세표준", "세액공제계")
+        candidates = [
+            table
+            for table in page
+            if all(
+                any(item in _compact(cell) for row in table for cell in row)
+                for item in required
+            )
         ]
     if not candidates:
         raise PdfToExcelError(f"원천징수 표를 찾지 못했습니다: {keyword}")
@@ -702,15 +712,12 @@ def _write_template_inputs(sheet, data: WithholdingPdfData) -> None:
 
     }
 
-    resident = data.resident_id
-
-    if len(resident) == 13:
-
-        resident = f"{resident[:6]}-{resident[6:]}"
+    resident = format_resident_id(data.resident_id)
 
     sheet["D8"] = _excel_value(data.employee_name)
 
     sheet["D9"] = _excel_value(resident)
+    sheet["D9"].number_format = "@"
 
     sheet["D11"] = data.values.get("기간")
 

@@ -20,7 +20,7 @@ from openpyxl.worksheet.formula import ArrayFormula
 
 from .employment_dates import parse_date
 from .errors import SchemaMismatch
-from .infra import safe_name, snapshot_file
+from .infra import format_resident_id, safe_name, snapshot_file
 from .payroll_status import NON_TAX_OVERTIME_HEADER, _digits, _normalized_name, _resident_key
 
 
@@ -286,6 +286,47 @@ def _formula_text(value: object) -> str | None:
     return text if isinstance(text, str) and text.startswith("=") else None
 
 
+def _numeric_value(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(str(value).replace(",", "").replace("%", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _append_tax_reduction_review_issue(
+    *,
+    issues: list[dict[str, object]],
+    year: int,
+    target: dict[str, object],
+    tax: dict[str, object],
+) -> None:
+    reduction = _numeric_value(tax.get("세액감면 계"))
+    if reduction is None or reduction <= 0:
+        return
+    rate = _numeric_value(tax.get("조특법 감면율"))
+    reason = None
+    if rate is None or rate <= 0:
+        reason = "조특법 감면율 확인 불가: 기존 세액감면액을 변경 산출세액 한도로 유지"
+    else:
+        calculated_tax = _numeric_value(tax.get("산출세액"))
+        normalized_rate = rate / 100 if rate > 1 else rate
+        if calculated_tax is None or abs(reduction - calculated_tax * normalized_rate) > 1:
+            reason = "기존 세액감면액이 산출세액과 감면율의 단순 계산값과 달라 한도 적용 여부 검토 필요"
+    if reason:
+        issues.append(
+            {
+                "year": year,
+                "employee_code": str(target.get("사원번호") or ""),
+                "employee_name": str(target.get("성명") or ""),
+                "type": "세액감면 수동 검토",
+                "reason": reason,
+                "original_tax_reduction": reduction,
+            }
+        )
+
+
 def _match_tool_tax_record(
     target: dict[str, object],
     tax_records: dict[str, list[dict[str, object]]],
@@ -355,6 +396,17 @@ def _populate_withholding_tool_data(
             )
             for column in range(1, data.max_column + 1)
         }
+        reduction_headers = ("조특법 감면율", "산출세액", "조특법 제30조", "세액감면 계")
+        if all(header in data_columns for header in reduction_headers) and "세액감면 계" in previous_columns:
+            rate_cell = data.cell(2, data_columns["조특법 감면율"]).coordinate
+            calculated_tax_cell = data.cell(2, data_columns["산출세액"]).coordinate
+            recalculated_reduction_cell = data.cell(2, data_columns["조특법 제30조"]).coordinate
+            original_reduction_cell = previous.cell(2, previous_columns["세액감면 계"]).coordinate
+            template_formulas[data_columns["세액감면 계"]] = (
+                f"=MAX(0,MIN({calculated_tax_cell},IF(N({rate_cell})>0,"
+                f"{recalculated_reduction_cell},N(prevData!{original_reduction_cell}))))",
+                False,
+            )
         template_styles = {
             column: copy(data.cell(2, column)._style)
             for column in range(1, data.max_column + 1)
@@ -377,6 +429,12 @@ def _populate_withholding_tool_data(
                     }
                 )
                 tax = {}
+            _append_tax_reduction_review_issue(
+                issues=issues,
+                year=year,
+                target=target,
+                tax=tax,
+            )
             row = {
                 header: target.get(header, tax.get(header))
                 for header in previous_columns
@@ -415,7 +473,12 @@ def _populate_withholding_tool_data(
 
         for row_number, row in enumerate(populated_rows, 2):
             for header, column in previous_columns.items():
-                previous.cell(row_number, column, row.get(header))
+                value = row.get(header)
+                if header == "주민등록번호":
+                    value = format_resident_id(value)
+                cell = previous.cell(row_number, column, value)
+                if header == "주민등록번호":
+                    cell.number_format = "@"
             for header, column in data_columns.items():
                 cell = data.cell(row_number, column)
                 cell._style = copy(template_styles[column])
@@ -431,7 +494,13 @@ def _populate_withholding_tool_data(
                         else translated
                     )
                 elif header in row:
-                    cell.value = row.get(header)
+                    cell.value = (
+                        format_resident_id(row.get(header))
+                        if header == "주민등록번호"
+                        else row.get(header)
+                    )
+                    if header == "주민등록번호":
+                        cell.number_format = "@"
 
         previous.auto_filter.ref = f"A1:{get_column_letter(previous.max_column)}{len(populated_rows) + 1}"
         data.auto_filter.ref = f"A1:{get_column_letter(data.max_column)}{len(populated_rows) + 1}"
@@ -586,10 +655,13 @@ def _write_monthly_workbook(path: Path, headers: list[str], rows: list[list[obje
     for values in rows:
         cells = []
         for column, value in enumerate(values, 1):
+            header = headers[column - 1]
+            if header in ("주민등록번호", "주민번호"):
+                value = format_resident_id(value)
             cell = WriteOnlyCell(sheet, value=value)
             cell.font = data_font
             cell.alignment = data_alignment
-            if column in (1, 3):
+            if column in (1, 3) or header in ("주민등록번호", "주민번호"):
                 cell.number_format = "@"
             elif column in (4, 5):
                 cell.number_format = DATE_FORMAT

@@ -12,6 +12,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill
 
 from .errors import SchemaMismatch
+from .infra import format_resident_id
 
 
 MASTER_SHEET = "고용2025_표준직업_연계표"
@@ -359,19 +360,16 @@ def discover_employee_info_sources(source_root: Path) -> tuple[Path | None, Path
         for path in root.rglob("*.xlsx")
         if path.is_file() and not path.name.startswith("~$")
     ]
-    employment_candidates = [
-        path
-        for path in files
-        if "근로자고용정보현황조회" in path.name
-    ]
-    mapped_employment = [path for path in employment_candidates if "직업분류매핑결과" in path.name]
+    mapped_employment = [path for path in files if "직업분류매핑결과" in path.name]
+    employment_candidates = [path for path in files if "근로자고용정보현황조회" in path.name]
     employment = mapped_employment or [
         path for path in employment_candidates if "직업분류매핑결과" not in path.name
     ]
     health = [path for path in files if "사업장가입자명부" in path.name]
     if len(employment) > 1:
+        label = "직업분류매핑결과" if mapped_employment else "근로자고용정보현황조회"
         raise SchemaMismatch(
-            "근로자고용정보현황조회 파일을 하나로 확정할 수 없습니다: "
+            f"{label} 파일을 하나로 확정할 수 없습니다: "
             + ", ".join(path.name for path in employment)
         )
     if len(health) > 1:
@@ -478,7 +476,11 @@ def _load_occupation_sheet(target, source_path: Path, linkage_path: Path) -> tup
                 name,
             )
             for column, value in enumerate(values, 1):
+                if column == 3:
+                    value = format_resident_id(value)
                 target.cell(target_row, column, value)
+                if column == 3:
+                    target.cell(target_row, column).number_format = "@"
             occupation_rows += 1
             if status == "매핑완료":
                 mapped += 1
@@ -519,7 +521,11 @@ def _load_health_sheet(target, source_path: Path) -> int:
             if not any(value not in (None, "") for value in values):
                 continue
             for column, value in enumerate(values, 1):
+                if column == 4:
+                    value = format_resident_id(value)
                 target.cell(target_row, column, value)
+                if column == 4:
+                    target.cell(target_row, column).number_format = "@"
             health_rows += 1
             target_row += 1
         return health_rows

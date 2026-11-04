@@ -112,6 +112,20 @@ class WithholdingPdfExcelTests(unittest.TestCase):
                 page_count=2,
             )
 
+    def test_accepts_page_two_table_without_settlement_title(self) -> None:
+        page_tables = sample_tables()
+        page_tables[1][0][0][0] = None
+
+        data = parse_withholding_tables(
+            path=Path("sample_1.pdf"),
+            year=2025,
+            page_tables=page_tables,
+            page_count=2,
+        )
+
+        self.assertEqual(8_000_000, data.values["근로소득금액"])
+        self.assertEqual(5_000_000, data.values["과세표준"])
+
     def test_escapes_formula_like_pdf_text(self) -> None:
         self.assertEqual("'=HYPERLINK(\"bad\")", _excel_value('=HYPERLINK("bad")'))
         self.assertEqual(-2000, _excel_value(-2000))

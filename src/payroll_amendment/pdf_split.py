@@ -148,7 +148,7 @@ def _validate_employee_page(page_text: str, exemption: TaxExemption) -> None:
 
 
 def withholding_pdf_output_name(pdf_index: int | str, employee_name: str) -> str:
-    return safe_name(f"{int(pdf_index)}_{employee_name}_발행자보관용.pdf")
+    return safe_name(f"{employee_name}_발행자보관용_{int(pdf_index)}.pdf")
 
 
 def _output_name(company_name: str, year: int, exemption: TaxExemption) -> str:

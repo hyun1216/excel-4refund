@@ -18,7 +18,7 @@ from openpyxl.utils import get_column_letter
 import pdfplumber
 
 from .errors import PdfToExcelError, SchemaMismatch
-from .infra import sha256
+from .infra import format_resident_id, sha256
 from .withholding_basic_info import (
     WITHHOLDING_HEADERS,
     _record,
@@ -37,6 +37,11 @@ _PAYROLL_FILE = re.compile(r".*?(?P<year>20\d{2})(?P<month>0[1-9]|1[0-2])_(?P<pa
 _KOREAN_PAYROLL_FILE = re.compile(
     r".*?(?P<year>20\d{2}|\d{2})\s*년\s*(?P<month>0?[1-9]|1[0-2])\s*월.*?급여대장"
     r"(?:.*?[_\- ](?P<part>\d+))?\.pdf$",
+    re.IGNORECASE,
+)
+_DATED_PAYROLL_FILE = re.compile(
+    r".*?(?P<year>20\d{2})(?P<month>0[1-9]|1[0-2])"
+    r"(?=.*(?:급여|상여)).*?\[(?:20\d{2})(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\]\.pdf$",
     re.IGNORECASE,
 )
 _RECEIPT_FILE = re.compile(r"^(?P<year>20\d{2}).*?(?P<start>\d+)_(?P<end>\d+)\.pdf$", re.IGNORECASE)
@@ -233,6 +238,9 @@ def _parse_payroll_name(path: Path) -> tuple[int, int, int]:
     matched = _PAYROLL_FILE.fullmatch(path.name)
     if matched is not None:
         return int(matched.group("year")), int(matched.group("month")), int(matched.group("part"))
+    matched = _DATED_PAYROLL_FILE.fullmatch(path.name)
+    if matched is not None:
+        return int(matched.group("year")), int(matched.group("month")), 1
     matched = _KOREAN_PAYROLL_FILE.fullmatch(path.name)
     if matched is None:
         raise SchemaMismatch(f"급여대장 파일명에서 연월을 찾지 못했습니다: {path.name}")
@@ -649,7 +657,7 @@ def _write_payroll_sheet(
         values: dict[str, object] = {
             "사원번호": record.employee_code,
             "성명": record.employee_name,
-            "주민등록번호": record.resident_id,
+            "주민등록번호": format_resident_id(record.resident_id),
             "급여구분": "급여",
             **record.payments,
             "지급합계": record.payment_total,
