@@ -33,6 +33,7 @@ Resources/Config.xlsx
 
 # Local Codex configuration
 .codex/
+.codex_tmp/
 
 # Keep the shared input directory itself in Git.
 # Do not add real employee/payroll data without a separate security review.
