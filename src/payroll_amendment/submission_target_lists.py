@@ -552,10 +552,32 @@ def generate_submission_target_lists(
     staging_files: list[Path] = []
     issues: list[dict[str, object]] = []
     year_reports: list[dict[str, object]] = []
+    generated_years: list[int] = []
+    skipped_years: list[int] = []
     for year, status_path in sorted(status_by_year.items()):
         targets = _load_targets(status_path)
         if not targets:
-            raise SchemaMismatch(f"{year}년 제출 대상자가 없습니다: {status_path.name}")
+            nts_directory = root / f"★국세청제출자료_{company_name}" / f"{year}년 {company_name} 국세청 제출 서류"
+            insurance_directory = root / f"★공단제출자료_{company_name}" / f"{year}년 {company_name} 공단 제출 서류"
+            for stale in (
+                nts_directory / safe_name(f"{company_name}_{year}년_국세청 제출용 대상자 명단.xlsx"),
+                insurance_directory / safe_name(
+                    f"{year}년 건강보험_퇴직정산_연말정산_재정산신청서_{company_name}.xls"
+                ),
+                insurance_directory / safe_name(
+                    f"{year}년 고용종료자_보수총액수정신고서_{company_name}.xlsx"
+                ),
+                insurance_directory / safe_name(
+                    f"{year}년 일반_보수총액신고서_{company_name}.xlsx"
+                ),
+                insurance_directory / safe_name(
+                    f"{year}년 고용보험_보수총액수정신고_{company_name}.xls"
+                ),
+            ):
+                stale.unlink(missing_ok=True)
+            skipped_years.append(year)
+            continue
+        generated_years.append(year)
         tax_records = _tool_tax_records(basic_info, year)
         health_records = _load_health_records(basic_info, year)
         nts_rows: list[list[object]] = []
@@ -762,6 +784,7 @@ def generate_submission_target_lists(
         "company_name": company_name,
         "status": "NEEDS_REVIEW" if issues else "SUCCEEDED",
         "years": year_reports,
+        "skipped_no_target_years": skipped_years,
         "issues": issues,
     }
     report_path = root / "제출용_대상자명단_생성보고서.json"
@@ -773,7 +796,7 @@ def generate_submission_target_lists(
     finally:
         temporary.unlink(missing_ok=True)
     return SubmissionTargetListResult(
-        tuple(sorted(status_by_year)),
+        tuple(generated_years),
         tuple(nts_files),
         tuple(health_files),
         tuple(employment_files),

@@ -31,6 +31,25 @@ def _make_basic(path: Path) -> None:
         10_000_000, 200_000, 10_000_000, 200_000, 100_000, 200_000, 200_000,
         None, 2_500_000, 2_000_000, 500_000, 500_000,
     ])
+    allowance = workbook.create_sheet("수당등록")
+    allowance.append(["■ 수당 등록"])
+    allowance.append([])
+    allowance.append(["수당명", "과세구분", "근로소득유형", "근로소득세부", "코드"])
+    allowance.append([
+        "야간연장수당(비과세)", "더존비과세", "연장근로",
+        "18-1.생산직등야간근로수당", "O01",
+    ])
+    allowance.append(["비과세식사대(P01)_총계", "기존비과세"])
+    allowance.append(["비과세식사대(P01)_현계", "기존비과세"])
+    allowance.append(["생산직등야간근로수당(O01)_총계", "기존비과세"])
+    allowance.append(["생산직등야간근로수당(O01)_현계", "기존비과세"])
+    adjustment = workbook.create_sheet("수당조정(비과세)")
+    adjustment.append(["■ 비과세 조정값"])
+    adjustment.append([])
+    adjustment.append(["구분"])
+    adjustment.append([
+        "기간", "연번", "사원번호", "이름", "주민번호", "인덱스", "과세차감총액",
+    ])
     workbook.save(path)
     workbook.close()
 
@@ -58,10 +77,14 @@ def _make_status(path: Path) -> None:
         "차인지급액",
         "직업분류 코드",
         "인덱스",
+        "비과세식사대(P01)_총계",
+        "비과세식사대(P01)_현계",
+        "생산직등야간근로수당(O01)_총계",
+        "생산직등야간근로수당(O01)_현계",
     ]
     target.append(headers)
-    target.append(["9001011234567", "홍길동", "9001011234567", "2022-12-01", "2023-01-31", "23년01월", "급여", 2_000_000, 0, 100_000, 2_100_000, 10_000, 3_000, 4_000, 17_000, 2_083_000, "9309", 7])
-    target.append(["9001011234567", "홍길동", "9001011234567", "2022-12-01", "2023-01-31", "23년합계", "급상여", 2_000_000, 0, 100_000, 2_100_000, 10_000, 3_000, 4_000, 17_000, 2_083_000, "9309", 7])
+    target.append(["9001011234567", "홍길동", "9001011234567", "2022-12-01", "2023-01-31", "23년01월", "급여", 2_000_000, 0, 100_000, 2_100_000, 10_000, 3_000, 4_000, 17_000, 2_083_000, "9309", 7, 200_000, 200_000, 200_000, 200_000])
+    target.append(["9001011234567", "홍길동", "9001011234567", "2022-12-01", "2023-01-31", "23년합계", "급상여", 2_000_000, 0, 100_000, 2_100_000, 10_000, 3_000, 4_000, 17_000, 2_083_000, "9309", 7, 200_000, 200_000, 200_000, 200_000])
     non_target = workbook.create_sheet("비대상자")
     non_target.append([header for header in headers if header != "야간연장수당(비과세)"])
     non_target.append(["9101011234567", "김철수", "9101011234567", "", "", "23년02월", "급여", 3_000_000, 0, 3_000_000, 20_000, 5_000, 6_000, 31_000, 2_969_000, "사무원", None])
@@ -176,6 +199,26 @@ def test_prepares_modified_status_tools_and_monthly_ledgers(tmp_path, caplog):
     assert tool_book["Data"]["G2"].value == "=prevData!G2"
     assert tool_book["Data"]["AF2"].value == "=MAX(0,MIN(AD2,IF(N(H2)>0,AE2,N(prevData!Y2))))"
     tool_book.close()
+    basic_book = load_workbook(basic, data_only=False, read_only=True)
+    adjustment = basic_book["수당조정(비과세)"]
+    assert [adjustment.cell(5, column).value for column in range(1, 9)] == [
+        "2023년", 1, "9001011234567", "홍길동", "900101-1234567", "7", -100_000, 100_000,
+    ]
+    adjustment_headers = [cell.value for cell in adjustment[4]]
+    assert adjustment.cell(
+        5,
+        adjustment_headers.index("비과세식사대(P01)_총계") + 1,
+    ).value == 200_000
+    assert adjustment.cell(
+        5,
+        adjustment_headers.index("생산직등야간근로수당(O01)_총계") + 1,
+    ).value == 100_000
+    assert adjustment.cell(
+        5,
+        adjustment_headers.index("생산직등야간근로수당(O01)_현계") + 1,
+    ).value == 100_000
+    assert adjustment["E5"].number_format == "@"
+    basic_book.close()
     assert any(issue["type"] == "세액감면 수동 검토" for issue in result.issues)
     assert len(result.monthly_payroll_files) == 12
 
@@ -210,6 +253,59 @@ def test_prepares_modified_status_tools_and_monthly_ledgers(tmp_path, caplog):
     assert february_book["Sheet1"]["D2"].value is None
     assert february_book["Sheet1"]["E2"].value is None
     february_book.close()
+
+
+def test_excludes_year_with_no_target_rows_and_removes_stale_outputs(tmp_path, caplog):
+    caplog.set_level("INFO")
+    basic = tmp_path / "테스트_기초정보.xlsx"
+    status = tmp_path / "테스트_23년 급상여현황.xlsx"
+    tool_template = tmp_path / "Temp_수정 원천징수영수증 생성 Tool.xlsx"
+    modified_root = tmp_path / "Input_급상여현황(수정)"
+    correction_root = tmp_path / "2.근로소득 수정신고" / "1.Input"
+    _make_basic(basic)
+    _make_status(status)
+    _make_tool(tool_template)
+
+    status_book = load_workbook(status)
+    target = status_book["대상자(작업)"]
+    target.delete_rows(2, target.max_row)
+    status_book.save(status)
+    status_book.close()
+
+    modified_root.mkdir()
+    correction_root.mkdir(parents=True)
+    stale_modified = modified_root / "테스트_23년 급상여현황(수정).xlsx"
+    stale_tool = modified_root / "테스트_23년 수정 원천징수영수증 생성 Tool.xlsx"
+    stale_monthly = correction_root / "테스트_23년01월_급여대장.xls"
+    for path in (stale_modified, stale_tool, stale_monthly):
+        path.write_bytes(b"stale")
+
+    result = prepare_correction_inputs(
+        company_name="테스트",
+        basic_info_path=basic,
+        payroll_files=(),
+        payroll_status_files=(status,),
+        tool_template_path=tool_template,
+        modified_input_directory=modified_root,
+        correction_input_directory=correction_root,
+        xls_converter=_copy_converter,
+    )
+
+    assert result.years == ()
+    assert result.modified_status_files == ()
+    assert result.withholding_tool_files == ()
+    assert result.monthly_payroll_files == ()
+    assert result.issues == (
+        {
+            "year": 2023,
+            "type": "대상자 없음",
+            "detail": "대상자 합계행 0개로 수정신고 입력자료 생성 제외",
+        },
+    )
+    assert "2023년 수정신고 입력자료 생성 제외: 대상자 합계행 0개" in caplog.messages
+    assert not stale_modified.exists()
+    assert not stale_tool.exists()
+    assert not stale_monthly.exists()
 
 
 def test_tax_reduction_review_distinguishes_rate_and_limit_cases():

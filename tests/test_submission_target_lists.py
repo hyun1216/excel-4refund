@@ -199,6 +199,43 @@ def test_generates_nts_and_insurance_target_lists(tmp_path: Path) -> None:
         legacy_employment_handle.close()
 
 
+def test_skips_year_with_no_submission_targets(tmp_path: Path) -> None:
+    basic = tmp_path / "테스트_기초정보.xlsx"
+    status = tmp_path / "테스트_23년 급상여현황.xlsx"
+    output = tmp_path / "output"
+    _make_basic(basic)
+    _make_status(status)
+
+    workbook = load_workbook(status)
+    for sheet_name in ("대상자(작업)", "대상자"):
+        sheet = workbook[sheet_name]
+        sheet.delete_rows(2, sheet.max_row)
+    workbook.save(status)
+    workbook.close()
+
+    stale = (
+        output
+        / "★공단제출자료_테스트"
+        / "2023년 테스트 공단 제출 서류"
+        / "2023년 일반_보수총액신고서_테스트.xlsx"
+    )
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"stale")
+
+    result = generate_submission_target_lists(
+        company_name="테스트",
+        basic_info_path=basic,
+        payroll_status_files=[status],
+        output_root=output,
+        xls_converter=lambda pairs: None,
+    )
+
+    assert result.years == ()
+    assert result.nts_files == ()
+    assert result.insurance_files == ()
+    assert not stale.exists()
+
+
 def test_retired_employee_stays_only_in_correction_form(tmp_path: Path) -> None:
     basic = tmp_path / "테스트_기초정보.xlsx"
     status = tmp_path / "테스트_23년 급상여현황.xlsx"

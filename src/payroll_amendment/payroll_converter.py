@@ -13,6 +13,7 @@ from typing import Callable, Iterable
 from uuid import uuid4
 
 import pandas as pd
+import pdfplumber
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -41,6 +42,10 @@ from .withholding_payroll_ledger import build_monthly_payroll_ledger_from_pdfs
 
 
 logger = logging.getLogger(__name__)
+
+
+class InsuranceColumnConflict(SchemaMismatch):
+    pass
 
 
 IDENTITY_HEADER_ORDER = (
@@ -74,6 +79,7 @@ STANDARD_HEADERS = (
 )
 
 IDENTITY_HEADERS = set(IDENTITY_HEADER_ORDER)
+INVALID_TOTALS_COLUMN = "__invalid_totals__"
 IGNORED_HEADERS = {"실입사일"}
 PAYMENT_HEADERS = (
     "기본급",
@@ -93,6 +99,7 @@ DEDUCTION_HEADERS = (
     "지방소득세",
     "기타공제",
 )
+CANONICAL_INSURANCE_HEADERS = frozenset(("국민연금", "건강보험", "장기요양", "고용보험"))
 TOTAL_HEADERS = {"지급합계", "공제합계", "차인지급액"}
 NUMERIC_HEADERS = set(PAYMENT_HEADERS) | set(DEDUCTION_HEADERS) | TOTAL_HEADERS
 HEADER_SCAN_KEYWORDS = {"성명", "사원번호", "기본급", "지급합계", "차인지급액"}
@@ -174,6 +181,11 @@ def _normalized_header(value: object) -> str:
 
 def _first_nonblank(series: pd.Series) -> pd.Series:
     return series.fillna("").astype(str).str.strip()
+
+
+def _clean_employee_name(value: object) -> str:
+    text = re.sub(r"\([^)]*\)|\[[^]]*\]|\{[^}]*\}|<[^>]*>", "", str(value or ""))
+    return re.sub(r"[^가-힣]", "", text)
 
 
 def _append_unique_headers(target: list[str], values: Iterable[object]) -> None:
@@ -264,6 +276,40 @@ def _canonical_coded_item_label(value: object) -> str:
     return re.sub(r"\s+", " ", display).strip()
 
 
+def _canonical_insurance_header(value: object) -> str | None:
+    key = _normalized_header(value)
+    if "장기요양" in key:
+        return "장기요양"
+    if "고용보험" in key:
+        return "고용보험"
+    if "국민연금" in key:
+        return "국민연금"
+    if "건강보험" in key or "건보료" in key:
+        return "건강보험"
+    return None
+
+
+def _merge_numeric_values(
+    output: pd.DataFrame,
+    target: str,
+    values: pd.Series,
+) -> None:
+    if target not in output:
+        output[target] = values
+        return
+    if target not in CANONICAL_INSURANCE_HEADERS:
+        output[target] = output[target] + values
+        return
+    existing = output[target]
+    conflicts = existing.ne(0) & values.ne(0) & existing.ne(values)
+    if conflicts.any():
+        rows = ", ".join(str(index) for index in values.index[conflicts][:10])
+        raise InsuranceColumnConflict(
+            f"동일 보험료 후보 열의 금액이 서로 다릅니다: {target}, 원본 행 {rows}"
+        )
+    output[target] = existing.where(existing.ne(0), values)
+
+
 def _target_years(value: object) -> list[int]:
     if value in (None, ""):
         return []
@@ -292,29 +338,153 @@ def _append_item_year(target: dict[str, list[int]], item: object, year: int) -> 
         years.append(normalized_year)
 
 
+def _receipt_work_period_year(path: Path) -> int:
+    date_pattern = re.compile(
+        r"(?<!\d)(20\d{2})\s*[./-]\s*(?:0?[1-9]|1[0-2])\s*[./-]\s*"
+        r"(?:0?[1-9]|[12]\d|3[01])(?!\d)"
+    )
+    with pdfplumber.open(path) as document:
+        if not document.pages:
+            raise SchemaMismatch(f"원천징수영수증에 페이지가 없습니다: {path.name}")
+        for table in document.pages[0].extract_tables():
+            for row in table:
+                label_column = next(
+                    (
+                        index
+                        for index, value in enumerate(row)
+                        if "⑪근무기간" in re.sub(r"\s+", "", str(value or ""))
+                    ),
+                    None,
+                )
+                if label_column is None:
+                    continue
+                values = " ".join(str(value or "") for value in row[label_column + 1 :])
+                matched = date_pattern.search(values)
+                if matched is not None:
+                    return int(matched.group(1))
+    raise SchemaMismatch(
+        f"원천징수영수증 1페이지의 ⑪ 근무기간 시작일을 찾지 못했습니다: {path.name}"
+    )
+
+
 def _receipt_year(path: Path) -> int:
-    matched = re.search(r"(?<!\d)(20\d{2}|\d{2})\s*년", path.name)
+    try:
+        return _receipt_work_period_year(path)
+    except SchemaMismatch:
+        pass
+    matched = re.search(r"(?<!\d)(20\d{2})(?!\d)", path.name)
     if matched is not None:
-        value = int(matched.group(1))
-        return value if value >= 2000 else 2000 + value
+        return int(matched.group(1))
+    matched = re.search(r"(?<!\d)(\d{2})\s*년", path.name)
+    if matched is not None:
+        return 2000 + int(matched.group(1))
     try:
         return _receipt_range(path)[0]
     except SchemaMismatch:
         pass
-    reader = PdfReader(str(path))
-    compact = re.sub(r"\s+", "", reader.pages[0].extract_text() or "")
-    matched = re.search(r"(?:근무기간|귀속연도).*?(20\d{2})", compact)
-    if matched is None:
-        raise SchemaMismatch(f"원천징수영수증에서 귀속연도를 찾지 못했습니다: {path.name}")
-    return int(matched.group(1))
+    raise SchemaMismatch(f"원천징수영수증에서 귀속연도를 찾지 못했습니다: {path.name}")
 
 
 def _payroll_workbook_year(path: Path) -> int:
     matched = re.search(r"(?<!\d)(20\d{2}|\d{2})\s*년", path.name)
+    if matched is not None:
+        value = int(matched.group(1))
+        return value if value >= 2000 else 2000 + value
+    matched = re.search(
+        r"(?<!\d)(20\d{2})(?:[-_. ]?)(?:0[1-9]|1[0-2])(?!\d)",
+        path.stem,
+    )
+    if matched is None:
+        matched = re.search(
+            r"(?<!\d)(\d{2})[-_. ](?:0[1-9]|1[0-2])(?!\d)",
+            path.stem,
+        )
     if matched is None:
         raise SchemaMismatch(f"Excel 급여대장 파일명에서 연도를 찾지 못했습니다: {path.name}")
     value = int(matched.group(1))
     return value if value >= 2000 else 2000 + value
+
+
+def _payroll_workbook_period(path: Path) -> tuple[int, int | None]:
+    year = _payroll_workbook_year(path)
+    matched = re.search(
+        r"(?<!\d)(?:20\d{2}|\d{2})\s*년\D*?(0?[1-9]|1[0-2])\s*월",
+        path.name,
+    )
+    if matched is None:
+        matched = re.search(
+            r"(?<!\d)(?:20\d{2})(?:[-_. ]?)(0[1-9]|1[0-2])(?!\d)",
+            path.stem,
+        )
+    if matched is None:
+        matched = re.search(
+            r"(?<!\d)(?:\d{2})[-_. ](0[1-9]|1[0-2])(?!\d)",
+            path.stem,
+        )
+    return year, int(matched.group(1)) if matched else None
+
+
+def _group_payroll_workbooks(
+    paths: Iterable[Path],
+) -> tuple[dict[int, Path], dict[int, dict[int, Path]]]:
+    annual: dict[int, list[Path]] = {}
+    monthly: dict[int, dict[int, list[Path]]] = {}
+    for path in paths:
+        year, month = _payroll_workbook_period(path)
+        if month is None:
+            annual.setdefault(year, []).append(path)
+        else:
+            monthly.setdefault(year, {}).setdefault(month, []).append(path)
+
+    duplicate_annual_years = sorted(year for year, items in annual.items() if len(items) > 1)
+    if duplicate_annual_years:
+        raise SchemaMismatch(
+            f"같은 연도의 통합 Excel 급여대장이 두 개 이상입니다: {duplicate_annual_years}"
+        )
+    mixed_years = sorted(set(annual) & set(monthly))
+    if mixed_years:
+        raise SchemaMismatch(
+            f"같은 연도의 통합·월별 Excel 급여대장이 함께 있습니다: {mixed_years}"
+        )
+    duplicate_months = {
+        year: sorted(month for month, items in months.items() if len(items) > 1)
+        for year, months in monthly.items()
+    }
+    duplicate_months = {year: months for year, months in duplicate_months.items() if months}
+    if duplicate_months:
+        details = ", ".join(
+            f"{year}년({', '.join(f'{month:02d}월' for month in months)})"
+            for year, months in sorted(duplicate_months.items())
+        )
+        raise SchemaMismatch(f"같은 연도·월의 Excel 급여대장이 두 개 이상입니다: {details}")
+
+    return (
+        {year: items[0] for year, items in annual.items()},
+        {
+            year: {month: items[0] for month, items in months.items()}
+            for year, months in monthly.items()
+        },
+    )
+
+
+def _merge_monthly_payroll_workbooks(
+    workbooks_by_month: dict[int, Path],
+    output_path: Path,
+) -> None:
+    merged = Workbook()
+    merged.remove(merged.active)
+    for month, path in sorted(workbooks_by_month.items()):
+        source = load_workbook(path, read_only=True, data_only=True)
+        try:
+            for sheet_index, source_sheet in enumerate(source.worksheets, 1):
+                target_sheet = merged.create_sheet(f"{month:02d}월_{sheet_index}")
+                for row in source_sheet.iter_rows(values_only=True):
+                    target_sheet.append(list(row))
+        finally:
+            source.close()
+    if not merged.worksheets:
+        raise SchemaMismatch("월별 Excel 급여대장에서 시트를 찾지 못했습니다.")
+    merged.save(output_path)
 
 
 def _update_basic_info_item_headers(
@@ -562,7 +732,7 @@ class PayrollConverter:
         self,
         *,
         unknown_item_policy: str = "aggregate",
-        tolerance: float = 0,
+        tolerance: float = 1,
         llm_header_classifier: Callable[[list[str]], dict[str, str]] | None = None,
     ) -> None:
         if unknown_item_policy not in {"aggregate", "separate"}:
@@ -647,8 +817,9 @@ class PayrollConverter:
                     unknown[target] = kind
             elif normalized and pay_total < index < deduction_total:
                 kind = "deduction"
-                target = _source_header(raw) or None
-                if canonical is None and target:
+                insurance_header = _canonical_insurance_header(raw)
+                target = insurance_header or _source_header(raw) or None
+                if canonical is None and insurance_header is None and target:
                     unknown[target] = kind
             elif target is None:
                 kind = "ignored"
@@ -663,6 +834,8 @@ class PayrollConverter:
         for column in cleaned.columns:
             if column in IDENTITY_HEADERS:
                 cleaned[column] = _first_nonblank(cleaned[column])
+                if column == "성명":
+                    cleaned[column] = cleaned[column].map(_clean_employee_name)
                 continue
             values = (
                 cleaned[column]
@@ -702,6 +875,53 @@ class PayrollConverter:
                     warnings.append(ValidationWarning(position, employee, check, calculated, source))
         return warnings
 
+    @staticmethod
+    def _employee_identity(row: pd.Series) -> tuple[str, str, str]:
+        return (
+            str(row.get("사원번호", "") or "").strip(),
+            str(row.get("성명", "") or "").strip(),
+            re.sub(r"\D", "", str(row.get("주민등록번호", "") or "")),
+        )
+
+    @classmethod
+    def _invalid_employee_identities(
+        cls,
+        frame: pd.DataFrame,
+        warnings: Iterable[ValidationWarning],
+    ) -> set[tuple[str, str, str]]:
+        invalid_positions = sorted({warning.row_number - 2 for warning in warnings})
+        return {
+            cls._employee_identity(frame.iloc[position])
+            for position in invalid_positions
+        }
+
+    @classmethod
+    def _zero_invalid_employee_amounts(
+        cls,
+        frame: pd.DataFrame,
+        invalid_identities: set[tuple[str, str, str]],
+    ) -> pd.DataFrame:
+        invalid_positions = [
+            position
+            for position, (_, row) in enumerate(frame.iterrows())
+            if cls._employee_identity(row) in invalid_identities
+        ]
+        if not invalid_positions:
+            return frame
+        cleaned = frame.copy()
+        amount_columns = [
+            column
+            for column in cleaned.columns
+            if column not in IDENTITY_HEADERS and column != INVALID_TOTALS_COLUMN
+        ]
+        column_positions = [cleaned.columns.get_loc(column) for column in amount_columns]
+        for position in invalid_positions:
+            cleaned.iloc[position, column_positions] = 0
+        cleaned[INVALID_TOTALS_COLUMN] = False
+        for position in invalid_positions:
+            cleaned.iloc[position, cleaned.columns.get_loc(INVALID_TOTALS_COLUMN)] = True
+        return cleaned
+
     def classify_unknown_headers_with_llm(self, headers: Iterable[str]) -> dict[str, str]:
         names = sorted({_normalized_header(header) for header in headers if _normalized_header(header)})
         if self.llm_header_classifier is None:
@@ -737,7 +957,7 @@ class PayrollConverter:
                     output[target] = output[target].where(output[target].astype(str).str.strip() != "", values)
             else:
                 values = numeric_values if numeric_values is not None else _numeric_values(raw[source_column])
-                output[target] = output.get(target, 0) + values
+                _merge_numeric_values(output, target, values)
 
         headers = [
             *IDENTITY_HEADER_ORDER,
@@ -1020,7 +1240,8 @@ class PayrollConverter:
                     unknown[target] = "deduction"
                 else:
                     label = label_registry.get(_normalized_header(label), label)
-                    target = (
+                    insurance_header = _canonical_insurance_header(label)
+                    target = insurance_header or (
                         f"{label} [{code}]"
                         if deduction_counts[_normalized_header(label)] > 1
                         else label
@@ -1042,7 +1263,7 @@ class PayrollConverter:
 
             def add_numeric_column(source_index: int, target: str) -> None:
                 values = _numeric_values(data.iloc[:, source_index])
-                output[target] = output.get(target, 0) + values
+                _merge_numeric_values(output, target, values)
 
             for index, target, _ in payment_specs:
                 add_numeric_column(index, target)
@@ -1124,7 +1345,10 @@ class PayrollConverter:
         if headers is None:
             headers = []
             for frame in months.values():
-                _append_unique_headers(headers, frame.columns)
+                _append_unique_headers(
+                    headers,
+                    (column for column in frame.columns if column != INVALID_TOTALS_COLUMN),
+                )
         if not headers:
             headers = list(STANDARD_HEADERS)
         header_alignment = Alignment(horizontal="center", vertical="center")
@@ -1136,10 +1360,21 @@ class PayrollConverter:
             frame = months.get(month, pd.DataFrame(columns=headers))
             worksheet.append(headers)
             ordered_frame = frame.reindex(columns=headers)
-            for record in ordered_frame.itertuples(index=False, name=None):
+            invalid_flags = frame.get(
+                INVALID_TOTALS_COLUMN,
+                pd.Series(False, index=frame.index),
+            ).fillna(False)
+            for record, invalid_totals in zip(
+                ordered_frame.itertuples(index=False, name=None),
+                invalid_flags,
+            ):
                 values = []
                 for header, value in zip(headers, record):
-                    if pd.isna(value) or (header not in IDENTITY_HEADERS and value == 0):
+                    if pd.isna(value) or (
+                        header not in IDENTITY_HEADERS
+                        and value == 0
+                        and not invalid_totals
+                    ):
                         value = None
                     elif header == "주민등록번호":
                         value = format_resident_id(value)
@@ -1207,6 +1442,7 @@ class PayrollConverter:
         source = Path(source_path).resolve(strict=True)
         months: dict[int, pd.DataFrame] = {}
         warnings: list[ValidationWarning] = []
+        invalid_employee_identities: set[tuple[str, str, str]] = set()
         unknown: dict[str, str] = {}
         payment_headers: list[str] = []
         deduction_headers: list[str] = []
@@ -1248,6 +1484,8 @@ class PayrollConverter:
                         excel_file=excel_file,
                         header_row=header_rows[sheet_name],
                     )
+                except InsuranceColumnConflict:
+                    raise
                 except SchemaMismatch:
                     continue
                 _append_unique_headers(payment_headers, sheet_payment_headers)
@@ -1256,20 +1494,33 @@ class PayrollConverter:
                 _append_unique_headers(active_deduction_headers, sheet_active_deduction_headers)
                 month = self._month_from_sheet(sheet_name, fallback)
                 fallback = min(12, fallback + 1)
+                sheet_warnings = self.validate_totals(frame)
+                if sheet_warnings:
+                    invalid_count = len({warning.row_number for warning in sheet_warnings})
+                    logger.warning(
+                        "급여 합계 불일치 직원 금액 0원 처리: %s, %d명",
+                        sheet_name,
+                        invalid_count,
+                    )
+                    invalid_employee_identities.update(
+                        self._invalid_employee_identities(frame, sheet_warnings)
+                    )
+                    warnings.extend(sheet_warnings)
                 months[month] = pd.concat(
                     [months.get(month, pd.DataFrame()), frame],
                     ignore_index=True,
                 )
-                warnings.extend(self.validate_totals(frame))
                 unknown.update(self._last_unknown_columns)
         if not months:
             raise SchemaMismatch(f"급여 시트를 찾지 못했습니다: {source.name}")
-        if strict and warnings:
-            first = warnings[0]
-            raise SchemaMismatch(
-                f"급여 합계 검증에 실패했습니다: {source.name}, 행 {first.row_number}, "
-                f"{first.employee_name}, {first.check}, 계산={first.calculated:g}, 원본={first.source:g}"
-            )
+        if invalid_employee_identities:
+            months = {
+                month: self._zero_invalid_employee_amounts(
+                    frame,
+                    invalid_employee_identities,
+                )
+                for month, frame in months.items()
+            }
         inactive_unknown_headers = {
             header
             for header in unknown
@@ -1372,6 +1623,8 @@ class PayrollConverter:
             )
         id_match = re.search(r"(?:③|3\.)?사업자등록번호([0-9-]{10,14})", compact)
         if id_match is None:
+            id_match = re.search(r"(\d{3}-\d{2}-\d{5})(?=(?:③|3\.)사업자등록번호)", compact)
+        if id_match is None:
             id_match = re.search(r"(\d{3}-\d{2}-\d{5})", compact)
         if name_match is None or id_match is None:
             raise SchemaMismatch(f"원천징수영수증에서 회사명·사업자번호를 찾지 못했습니다: {receipt_path.name}")
@@ -1445,6 +1698,7 @@ class PayrollConverter:
         staging: Path,
         basic_template: Path,
         existing_output_directory: Path,
+        company_name_override: str | None = None,
     ) -> dict[str, object]:
         payroll_files = []
         payroll_workbooks = sorted(
@@ -1473,7 +1727,8 @@ class PayrollConverter:
             len(payroll_workbooks),
             len(receipt_files),
         )
-        company_name, company_id = self._company_metadata(receipt_files[0])
+        detected_company_name, company_id = self._company_metadata(receipt_files[0])
+        company_name = company_name_override or detected_company_name
         split_root = staging / f".{uuid4().hex}_receipts"
         split_root.mkdir(parents=True, exist_ok=False)
         receipt_paths_by_year: dict[int, list[Path]] = {}
@@ -1536,20 +1791,14 @@ class PayrollConverter:
         pdf_files_by_year: dict[int, list[Path]] = {}
         for path in payroll_files:
             pdf_files_by_year.setdefault(_parse_payroll_name(path)[0], []).append(path)
-        workbooks_by_year: dict[int, list[Path]] = {}
-        for path in payroll_workbooks:
-            workbooks_by_year.setdefault(_payroll_workbook_year(path), []).append(path)
-        duplicate_years = sorted(set(pdf_files_by_year) & set(workbooks_by_year))
+        annual_workbooks_by_year, monthly_workbooks_by_year = _group_payroll_workbooks(
+            payroll_workbooks
+        )
+        workbook_years = set(annual_workbooks_by_year) | set(monthly_workbooks_by_year)
+        duplicate_years = sorted(set(pdf_files_by_year) & workbook_years)
         if duplicate_years:
             raise SchemaMismatch(f"같은 연도의 PDF·Excel 급여대장이 함께 있습니다: {duplicate_years}")
-        multiple_workbook_years = sorted(
-            year for year, paths in workbooks_by_year.items() if len(paths) > 1
-        )
-        if multiple_workbook_years:
-            raise SchemaMismatch(
-                f"같은 연도의 Excel 급여대장이 두 개 이상입니다: {multiple_workbook_years}"
-            )
-        payroll_years = sorted(set(pdf_files_by_year) | set(workbooks_by_year))
+        payroll_years = sorted(set(pdf_files_by_year) | workbook_years)
         logger.info("연도별 급여대장 생성 시작 (총 %d개 연도)", len(payroll_years))
         for year in payroll_years:
             target = staging / f"{company_name}_{str(year)[-2:]}년 급여대장.xlsx"
@@ -1565,11 +1814,27 @@ class PayrollConverter:
                 intermediate.unlink(missing_ok=True)
             else:
                 controls = []
-                conversion = self.convert_excel_workbook(
-                    workbooks_by_year[year][0],
-                    target,
-                    strict=True,
-                )
+                annual_workbook = annual_workbooks_by_year.get(year)
+                if annual_workbook is not None:
+                    conversion = self.convert_excel_workbook(
+                        annual_workbook,
+                        target,
+                        strict=True,
+                    )
+                else:
+                    intermediate = staging / f".{uuid4().hex}_{year}_monthly.xlsx"
+                    try:
+                        _merge_monthly_payroll_workbooks(
+                            monthly_workbooks_by_year[year],
+                            intermediate,
+                        )
+                        conversion = self.convert_excel_workbook(
+                            intermediate,
+                            target,
+                            strict=True,
+                        )
+                    finally:
+                        intermediate.unlink(missing_ok=True)
             _append_unique_headers(payment_headers, conversion.payment_headers)
             _append_unique_headers(deduction_headers, conversion.deduction_headers)
             payment_headers_by_year[year] = conversion.active_payment_headers
@@ -1691,6 +1956,7 @@ class PayrollConverter:
         input_root: Path,
         output_directory: Path,
         basic_info_template: Path,
+        company_name: str | None = None,
     ) -> UniversalConversionResult:
         """한 거래처의 분류된 1.Input을 기초정보·연도별 급여대장으로 변환합니다."""
         source_root = Path(input_root).resolve(strict=True)
@@ -1699,7 +1965,13 @@ class PayrollConverter:
         staging = destination.parent / f".{destination.name}.{uuid4().hex}.tmp"
         staging.mkdir(parents=True, exist_ok=False)
         try:
-            group = self._convert_tabular_group(source_root, staging, template, destination)
+            group = self._convert_tabular_group(
+                source_root,
+                staging,
+                template,
+                destination,
+                company_name_override=company_name,
+            )
             outputs = group.pop("outputs")
             report = {
                 "input_root": str(source_root),

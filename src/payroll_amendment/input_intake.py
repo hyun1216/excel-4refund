@@ -76,7 +76,7 @@ def _looks_like_payroll_workbook(path: Path) -> bool:
         return False
     try:
         for sheet in workbook.worksheets:
-            for values in sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 15), values_only=True):
+            for values in sheet.iter_rows(min_row=1, max_row=15, values_only=True):
                 normalized = {re.sub(r"\s+", "", str(value or "")) for value in values}
                 if len(normalized & PAYROLL_KEYWORDS) >= 2:
                     return True
@@ -96,6 +96,22 @@ def _classify_file(path: Path) -> str:
     if _looks_like_payroll_workbook(path):
         return "tabular_payroll"
     return "unknown"
+
+
+def _current_company_names(classified: list[tuple[Path, str]]) -> set[str]:
+    names: set[str] = set()
+    markers = {
+        "employment_info": EMPLOYMENT_NAME,
+        "health_roster": HEALTH_NAME,
+    }
+    for path, kind in classified:
+        marker = markers.get(kind)
+        if marker is None:
+            continue
+        company_name = path.name.partition(marker)[0].rstrip(" _-")
+        if company_name:
+            names.add(company_name)
+    return names
 
 
 def _create_company_directories(company_directory: Path, company_name: str) -> dict[str, Path]:
@@ -194,13 +210,20 @@ def organize_input_batch(
 
     metadata = [metadata_reader(path) for path in receipt_files]
     company_ids = {company_id for _, company_id in metadata}
-    company_names = {company_name for company_name, _ in metadata}
-    if len(company_ids) != 1 or len(company_names) != 1:
+    if len(company_ids) != 1:
         raise SchemaMismatch(
             "한 접수 배치에 여러 거래처의 원천징수영수증이 섞여 있습니다: "
             + ", ".join(sorted(f"{name}({company_id})" for name, company_id in set(metadata)))
         )
-    company_name, company_id = metadata[0]
+    current_company_names = _current_company_names(classified)
+    if len(current_company_names) > 1:
+        raise SchemaMismatch(
+            "고용정보와 사업장가입자명부의 현재 상호가 다릅니다: "
+            + ", ".join(sorted(current_company_names))
+        )
+    company_name = next(iter(current_company_names), metadata[0][0])
+    company_id = next(iter(company_ids))
+    company_aliases = sorted({name for name, _ in metadata if name != company_name})
     company_directory = root / "노무_세무 수정신고" / safe_name(company_name)
     planned_roots = {
         "tabular_payroll": company_directory / "1. 급상여현황 생성" / "1.Input" / "급여대장",
@@ -251,6 +274,7 @@ def organize_input_batch(
         "input_directory": str(input_root),
         "company_name": company_name,
         "company_id": company_id,
+        "company_aliases": company_aliases,
         "company_directory": str(company_directory),
         "moved_files": [
             {

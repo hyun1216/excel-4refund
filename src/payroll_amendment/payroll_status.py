@@ -16,6 +16,7 @@ from openpyxl.utils import get_column_letter
 from .employment_dates import date_text
 from .errors import SchemaMismatch
 from .infra import format_resident_id, safe_name
+from .payroll_converter import _canonical_insurance_header
 
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,8 @@ BASE_FIXED_ITEMS = {
     "중식대",
 }
 BASE_FIXED_KEYWORDS = ("식대", "식사대")
+ROLE_ALLOWANCE_KEYWORDS = ("직책", "직무")
+REVIEW_ALLOWANCE_KEYWORDS = ("근무외수당",)
 MONEY_FORMAT = "#,##0;-#,##0;"
 THIN_GRAY = Side(style="thin", color="FF808080")
 CELL_BORDER = Border(left=THIN_GRAY, right=THIN_GRAY, top=THIN_GRAY, bottom=THIN_GRAY)
@@ -128,6 +131,14 @@ class PayrollStatusResult:
     updated_basic_info_path: Path
 
 
+@dataclass(frozen=True)
+class BasicInfoPreparationResult:
+    years: tuple[int, ...]
+    basic_info_path: Path
+    fixed_count: int
+    review_count: int
+
+
 def _normalized_name(value: object) -> str:
     text = re.sub(r"\([^)]*\)|\[[^]]*\]|\{[^}]*\}|<[^>]*>", "", str(value or ""))
     return re.sub(r"[^0-9A-Za-z가-힣]", "", text).casefold()
@@ -139,6 +150,12 @@ def _normalized_item_name(value: object) -> str:
 
 _BASE_FIXED_ITEM_KEYS = frozenset(_normalized_item_name(name) for name in BASE_FIXED_ITEMS)
 _BASE_FIXED_KEYWORD_KEYS = tuple(_normalized_item_name(keyword) for keyword in BASE_FIXED_KEYWORDS)
+_ROLE_ALLOWANCE_KEYWORD_KEYS = tuple(_normalized_item_name(keyword) for keyword in ROLE_ALLOWANCE_KEYWORDS)
+_REVIEW_ALLOWANCE_KEYWORD_KEYS = tuple(_normalized_item_name(keyword) for keyword in REVIEW_ALLOWANCE_KEYWORDS)
+
+
+def _is_role_allowance(key: str) -> bool:
+    return "수당" in key and any(keyword in key for keyword in _ROLE_ALLOWANCE_KEYWORD_KEYS)
 
 
 def _digits(value: object) -> str:
@@ -173,6 +190,17 @@ def _money(value: object) -> int:
         return int(round(float(text)))
     except ValueError as exc:
         raise SchemaMismatch(f"금액으로 해석할 수 없습니다: {value!r}") from exc
+
+
+def _insurance_amount(row: dict[str, object], target: str) -> int:
+    amounts = {
+        _money(value)
+        for header, value in row.items()
+        if _canonical_insurance_header(header) == target and _money(value) != 0
+    }
+    if len(amounts) > 1:
+        raise SchemaMismatch(f"동일 보험료 후보 열의 금액이 서로 다릅니다: {target}")
+    return next(iter(amounts), 0)
 
 
 def _header_map(values: tuple[object, ...] | list[object]) -> dict[str, int]:
@@ -242,6 +270,10 @@ class AutomaticItemRules:
 
     def classify(self, item_name: str) -> ItemDecision:
         key = _normalized_item_name(item_name)
+        if _is_role_allowance(key):
+            return ItemDecision(item_name, FIXED_SALARY, "직책·직무 수당")
+        if any(keyword in key for keyword in _REVIEW_ALLOWANCE_KEYWORD_KEYS):
+            return ItemDecision(item_name, REVIEW_ALLOWANCE, "근무외수당")
         if key in self.direct:
             standard, category = self.direct[key]
             return ItemDecision(item_name, category or UNCLASSIFIED, f"직접 매칭: {standard}")
@@ -267,9 +299,55 @@ class AutomaticItemRules:
 
 def _requires_regularity_check(item_name: str) -> bool:
     key = _normalized_item_name(item_name)
-    if any(keyword in key for keyword in _BASE_FIXED_KEYWORD_KEYS):
+    if _is_role_allowance(key) or any(keyword in key for keyword in _BASE_FIXED_KEYWORD_KEYS):
         return False
     return key not in _BASE_FIXED_ITEM_KEYS
+
+
+def _reviewed_item_categories(workbook, year: int) -> dict[str, str]:
+    if BUSINESS_SHEET not in workbook.sheetnames:
+        raise SchemaMismatch(f"기초정보에 {BUSINESS_SHEET} 시트가 없습니다.")
+    sheet = workbook[BUSINESS_SHEET]
+    categories: dict[str, str] = {}
+    year_specific: dict[str, str] = {}
+    rows = sheet.iter_rows(
+        min_row=5,
+        max_row=sheet.max_row,
+        min_col=10,
+        max_col=19,
+        values_only=True,
+    )
+    for values in rows:
+        for item_index, fixed_index, review_index, year_index in (
+            (0, 1, 2, None),
+            (6, 7, 8, 9),
+        ):
+            target = categories if year_index is None else year_specific
+            item_name = str(values[item_index] or "").strip()
+            if not item_name:
+                continue
+            if year_index is not None:
+                requested_years = {
+                    2000 + int(value[-2:])
+                    for value in re.findall(r"20\d{2}|\d{2}", str(values[year_index] or ""))
+                }
+                if requested_years and year not in requested_years:
+                    continue
+            fixed = str(values[fixed_index] or "").strip().casefold() == "o"
+            review = str(values[review_index] or "").strip().casefold() == "o"
+            if fixed and review:
+                raise SchemaMismatch(f"기초정보 지급항목에 정액급여와 수당검토가 모두 표시됐습니다: {item_name}")
+            if not fixed and not review:
+                continue
+            key = _normalized_item_name(item_name)
+            category = FIXED_SALARY if fixed else REVIEW_ALLOWANCE
+            if key in target and target[key] != category:
+                raise SchemaMismatch(f"기초정보 지급항목 검토 결과가 충돌합니다: {item_name}")
+            target[key] = category
+    categories.update(year_specific)
+    if not categories:
+        raise SchemaMismatch(f"{year}년 기초정보에 검토 완료된 정액급여·수당검토 표시가 없습니다.")
+    return categories
 
 
 def update_basic_info_item_markers(
@@ -477,26 +555,15 @@ def _match_tax(
     by_name: dict[str, list[TaxRecord]],
 ) -> tuple[TaxRecord | None, str | None]:
     normalized_name = _normalized_name(employee.name)
-    resident = _resident_id(employee.resident_id) or _resident_id(employee.code)
-    if resident:
-        identity_candidates = by_identity.get((resident, normalized_name), [])
-        if len(identity_candidates) == 1:
-            return identity_candidates[0], None
-        if len(identity_candidates) > 1:
-            return None, "원천징수 자료 동일 주민번호·성명 중복"
+    resident = _resident_id(employee.resident_id)
+    if not resident or not normalized_name:
         return None, "원천징수 자료 주민번호·성명 미연결"
-    employee_code = _employee_code(employee.code)
-    code_candidates = by_employee_code.get(employee_code, []) if employee_code else []
-    if len(code_candidates) == 1:
-        return code_candidates[0], None
-    if len(code_candidates) > 1:
-        return None, "원천징수 자료 사원번호 중복"
-    candidates = by_name.get(normalized_name, [])
-    if len(candidates) == 1:
-        return candidates[0], None
-    if not candidates:
-        return None, "원천징수 자료 미연결"
-    return None, "원천징수 자료 동명이인·중복"
+    identity_candidates = by_identity.get((resident, normalized_name), [])
+    if len(identity_candidates) == 1:
+        return identity_candidates[0], None
+    if len(identity_candidates) > 1:
+        return None, "원천징수 자료 동일 주민번호·성명 중복"
+    return None, "원천징수 자료 주민번호·성명 미연결"
 
 
 def _load_payroll(path: Path, year: int) -> tuple[list[str], list[str], list[str], list[EmployeeData]]:
@@ -506,6 +573,20 @@ def _load_payroll(path: Path, year: int) -> tuple[list[str], list[str], list[str
     payment_headers: list[str] = []
     deduction_headers: list[str] = []
     try:
+        residents_by_source: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+        for sheet in workbook.worksheets:
+            if not re.search(r"(?<!\d)(\d{1,2})\s*월", sheet.title):
+                continue
+            header_row, columns = _find_header_row(sheet, {"사원번호", "성명", *TOTAL_HEADERS}, 10)
+            for values in sheet.iter_rows(min_row=header_row + 1, values_only=True):
+                source_code = _employee_code(values[columns["사원번호"]])
+                name = str(values[columns["성명"]] or "").strip()
+                resident = _resident_id(
+                    values[columns["주민등록번호"]]
+                    if "주민등록번호" in columns else None
+                )
+                if source_code and name and resident:
+                    residents_by_source[(source_code, _normalized_name(name))].add(resident)
         for sheet in workbook.worksheets:
             month_match = re.search(r"(?<!\d)(\d{1,2})\s*월", sheet.title)
             if not month_match:
@@ -525,20 +606,29 @@ def _load_payroll(path: Path, year: int) -> tuple[list[str], list[str], list[str
                 if header and header not in deduction_headers:
                     deduction_headers.append(header)
             for values in sheet.iter_rows(min_row=header_row + 1, values_only=True):
-                code = _employee_code(values[columns["사원번호"]])
+                source_code = _employee_code(values[columns["사원번호"]])
                 name = str(values[columns["성명"]] or "").strip()
-                if not code and not name:
+                if not source_code and not name:
                     continue
                 if not name:
                     raise SchemaMismatch(f"{path.name}/{sheet.title}: 성명이 없는 급여 행이 있습니다.")
                 row = {header: values[index] if index < len(values) else None for header, index in columns.items()}
-                key = (code, _normalized_name(name))
+                resident = _resident_id(row.get("주민등록번호"))
+                if not resident:
+                    candidates = residents_by_source.get(
+                        (source_code, _normalized_name(name)),
+                        set(),
+                    )
+                    if len(candidates) == 1:
+                        resident = next(iter(candidates))
+                code = format_resident_id(resident) if resident else ""
+                key = (resident or f"사번:{source_code}", _normalized_name(name))
                 if key not in employees:
                     employees[key] = EmployeeData(
                         key=key,
                         code=code,
                         name=name,
-                        resident_id=_resident_id(row.get("주민등록번호")),
+                        resident_id=resident,
                     )
                     employee_order.append(key)
                 pay_type = str(row.get("급여구분") or "급여").strip()
@@ -547,7 +637,7 @@ def _load_payroll(path: Path, year: int) -> tuple[list[str], list[str], list[str
                 canonical = {
                     "사원번호": code,
                     "성명": name,
-                    "주민등록번호": _resident_id(row.get("주민등록번호")),
+                    "주민등록번호": resident,
                     "입사일": date_text(row.get("입사일")),
                     "퇴사일": date_text(row.get("퇴사일")),
                     "지급년월": f"{str(year)[-2:]}년{month:02d}월",
@@ -702,24 +792,7 @@ def _enrich_employees(
     current_identity, current_codes, current_names, detail_headers = _load_tax_records(workbook, year)
     prior_identity, prior_codes, prior_names, _ = _load_tax_records(workbook, year - 1)
     occupations, occupation_names = _load_occupations(workbook)
-    employee_keys_by_identity: defaultdict[tuple[str, str], set[tuple[str, str]]] = defaultdict(set)
     for employee in employees:
-        resident = _resident_id(employee.resident_id)
-        if resident:
-            employee_keys_by_identity[(resident, _normalized_name(employee.name))].add(employee.key)
-    for employee in employees:
-        resident_identity = (_resident_id(employee.resident_id), _normalized_name(employee.name))
-        split_employee_keys = employee_keys_by_identity.get(resident_identity, set())
-        if len(split_employee_keys) > 1:
-            employee.forced_reasons.append("재입사자 복수 사원번호")
-            issues.append({
-                "year": year,
-                "employee_code": employee.code,
-                "employee_name": employee.name,
-                "type": "대상 제외",
-                "detail": "동일 주민번호·성명이 복수 사원번호로 분리됨: "
-                + ", ".join(sorted(code for code, _ in split_employee_keys)),
-            })
         current, reason = _match_tax(employee, current_identity, current_codes, current_names)
         if current is None:
             issues.append({"year": year, "employee_code": employee.code, "employee_name": employee.name, "type": "미연결", "detail": reason})
@@ -758,12 +831,20 @@ def _classify_and_adjust(
     employees: list[EmployeeData],
     rules: AutomaticItemRules,
     issues: list[dict[str, object]],
+    reviewed_categories: dict[str, str] | None = None,
 ) -> tuple[list[ItemDecision], set[tuple[str, str]], set[tuple[tuple[str, str], str]], dict[tuple[str, str], list[dict[str, object]]]]:
     decisions: list[ItemDecision] = []
     for header in payment_headers:
-        decision = rules.classify(header)
+        reviewed_category = (reviewed_categories or {}).get(_normalized_item_name(header))
+        if reviewed_category:
+            decision = ItemDecision(header, reviewed_category, "기초정보 사람 검토 반영")
+        else:
+            decision = rules.classify(header)
+            if reviewed_categories is not None and decision.category in {FIXED_SALARY, REVIEW_ALLOWANCE}:
+                decision = ItemDecision(header, UNCLASSIFIED, "기초정보 검토에서 O 표시 없음")
         if (
             decision.category == FIXED_SALARY
+            and not reviewed_category
             and not rules.is_direct(header)
             and _requires_regularity_check(header)
         ):
@@ -795,7 +876,10 @@ def _classify_and_adjust(
             continue
         zero_insurance_months: set[str] = set()
         if any(
-            all(header in row for header in SOCIAL_INSURANCE_HEADERS)
+            all(
+                any(_canonical_insurance_header(candidate) == header for candidate in row)
+                for header in SOCIAL_INSURANCE_HEADERS
+            )
             for row in employee.monthly_rows
         ):
             insurance_by_month: defaultdict[str, dict[str, int]] = defaultdict(
@@ -804,7 +888,7 @@ def _classify_and_adjust(
             for row in employee.monthly_rows:
                 month = str(row["지급년월"])
                 for header in SOCIAL_INSURANCE_HEADERS:
-                    insurance_by_month[month][header] += _money(row.get(header))
+                    insurance_by_month[month][header] += _insurance_amount(row, header)
             zero_insurance_months = {
                 month
                 for month, amounts in insurance_by_month.items()
@@ -925,7 +1009,7 @@ def _write_sheet(
             cell.alignment = right_alignment if header in money_headers else center_alignment
             if header in money_headers and value not in (None, ""):
                 cell.number_format = MONEY_FORMAT
-            elif header == "주민등록번호":
+            elif header in {"사원번호", "주민등록번호"}:
                 cell.number_format = "@"
             if row_fill is not None:
                 cell.fill = row_fill
@@ -939,12 +1023,13 @@ def _generate_year(
     rules: AutomaticItemRules,
     output_directory: Path,
     issues: list[dict[str, object]],
+    reviewed_categories: dict[str, str] | None = None,
 ) -> tuple[Path, list[ItemDecision], int, int]:
     headers, payment_headers, _, employees = _load_payroll(payroll_path, year)
     detail_headers = _enrich_employees(basic_workbook, year, employees, issues)
     headers = [*headers[:-1], *detail_headers, headers[-1]]
     decisions, targets, target_months, adjusted_rows = _classify_and_adjust(
-        year, payment_headers, employees, rules, issues
+        year, payment_headers, employees, rules, issues, reviewed_categories
     )
     headers = _ordered_status_headers(headers, payment_headers, decisions)
     category_by_header = {
@@ -1008,14 +1093,16 @@ def generate_payroll_status_files(
     payroll_directory: Path,
     item_rules_path: Path,
     output_directory: Path,
+    use_reviewed_item_markers: bool = False,
 ) -> PayrollStatusResult:
     basic_info = Path(basic_info_path).resolve(strict=True)
     payroll_root = Path(payroll_directory).resolve(strict=True)
     output_root = Path(output_directory).resolve()
     years, year_inventory = detect_work_years(basic_info, payroll_root)
-    update_basic_info_years(basic_info, years)
     rules = AutomaticItemRules.load(item_rules_path)
-    update_basic_info_item_markers(basic_info, rules, payroll_root)
+    if not use_reviewed_item_markers:
+        update_basic_info_years(basic_info, years)
+        update_basic_info_item_markers(basic_info, rules, payroll_root)
     basic_workbook = load_workbook(basic_info, data_only=True, read_only=True)
     outputs: list[Path] = []
     issues: list[dict[str, object]] = []
@@ -1024,6 +1111,10 @@ def generate_payroll_status_files(
         logger.info("급상여현황 생성 시작 (총 %d개 연도)", len(years))
         for year in years:
             logger.info("%d년 급상여현황 생성 시작", year)
+            reviewed_categories = (
+                _reviewed_item_categories(basic_workbook, year)
+                if use_reviewed_item_markers else None
+            )
             candidates = [
                 path
                 for path in payroll_root.glob("*.xlsx")
@@ -1032,7 +1123,14 @@ def generate_payroll_status_files(
             if len(candidates) != 1:
                 raise SchemaMismatch(f"{year}년 급여대장 후보가 {len(candidates)}개입니다: {payroll_root}")
             output, decisions, target_count, non_target_count = _generate_year(
-                company_name, year, candidates[0], basic_workbook, rules, output_root, issues
+                company_name,
+                year,
+                candidates[0],
+                basic_workbook,
+                rules,
+                output_root,
+                issues,
+                reviewed_categories,
             )
             outputs.append(output)
             year_reports.append(
@@ -1058,6 +1156,9 @@ def generate_payroll_status_files(
         "year_inventory": year_inventory,
         "basic_info_year_cell": f"{BUSINESS_SHEET}!{YEAR_CELL}",
         "basic_info_year_value": ",".join(str(year)[-2:] for year in years),
+        "item_classification_source": (
+            "reviewed_basic_info" if use_reviewed_item_markers else "automatic_rules"
+        ),
         "temporary_prior_income_rule": "2022년 자료가 없을 때 2023년 과세소득을 2023년 전년도 과세소득으로 사용",
         "years": year_reports,
         "issues": issues,
@@ -1074,17 +1175,47 @@ def generate_payroll_status_files(
     return PayrollStatusResult(years, tuple(outputs), report_path, basic_info)
 
 
-def generate_company_payroll_status(company_directory: Path, resources_directory: Path) -> PayrollStatusResult:
-    company_root = Path(company_directory).resolve(strict=True)
-    resources_root = Path(resources_directory).resolve(strict=True)
+def _company_basic_info(company_root: Path) -> Path:
     basic_candidates = [path for path in company_root.glob("*_기초정보.xlsx") if not path.name.startswith("~$")]
     if len(basic_candidates) != 1:
         raise SchemaMismatch(f"회사 폴더의 기초정보 파일 후보가 {len(basic_candidates)}개입니다: {company_root}")
-    company_name = basic_candidates[0].name.removesuffix("_기초정보.xlsx")
+    return basic_candidates[0]
+
+
+def prepare_company_basic_info_for_review(
+    company_directory: Path,
+    resources_directory: Path,
+) -> BasicInfoPreparationResult:
+    company_root = Path(company_directory).resolve(strict=True)
+    resources_root = Path(resources_directory).resolve(strict=True)
+    basic_info = _company_basic_info(company_root)
+    payroll_directory = company_root / "2.근로소득 수정신고" / "1.Input"
+    years, _ = detect_work_years(basic_info, payroll_directory)
+    update_basic_info_years(basic_info, years)
+    rules = AutomaticItemRules.load(resources_root / "지급항목_매칭표.xlsx")
+    fixed_count, review_count = update_basic_info_item_markers(
+        basic_info,
+        rules,
+        payroll_directory,
+    )
+    return BasicInfoPreparationResult(years, basic_info, fixed_count, review_count)
+
+
+def generate_company_payroll_status(
+    company_directory: Path,
+    resources_directory: Path,
+    *,
+    use_reviewed_item_markers: bool = False,
+) -> PayrollStatusResult:
+    company_root = Path(company_directory).resolve(strict=True)
+    resources_root = Path(resources_directory).resolve(strict=True)
+    basic_info = _company_basic_info(company_root)
+    company_name = basic_info.name.removesuffix("_기초정보.xlsx")
     return generate_payroll_status_files(
         company_name=company_name,
-        basic_info_path=basic_candidates[0],
+        basic_info_path=basic_info,
         payroll_directory=company_root / "2.근로소득 수정신고" / "1.Input",
         item_rules_path=resources_root / "지급항목_매칭표.xlsx",
         output_directory=company_root / "1. 급상여현황 생성" / "급상여현황",
+        use_reviewed_item_markers=use_reviewed_item_markers,
     )

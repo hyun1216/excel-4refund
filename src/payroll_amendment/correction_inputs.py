@@ -64,6 +64,17 @@ TOOL_NON_TAX_DETAILS = (
     ("야간근로수당", "야간근로수당", "O01"),
     ("비과세식대(P01)", "비과세식대", "P01"),
 )
+TAX_ADJUSTMENT_SHEET = "수당조정(비과세)"
+ALLOWANCE_REGISTER_SHEET = "수당등록"
+TAX_ADJUSTMENT_BASE_HEADERS = (
+    "기간",
+    "연번",
+    "사원번호",
+    "이름",
+    "주민번호",
+    "인덱스",
+    "과세차감총액",
+)
 
 
 @dataclass(frozen=True)
@@ -254,7 +265,11 @@ def _tool_tax_records(basic_info_path: Path, year: int) -> dict[str, list[dict[s
         workbook.close()
 
 
-def _tool_target_rows(status_path: Path) -> list[dict[str, object]]:
+def _tool_target_rows(
+    status_path: Path,
+    *,
+    allow_empty: bool = False,
+) -> list[dict[str, object]]:
     workbook = load_workbook(status_path, data_only=True, read_only=True)
     try:
         if "대상자(작업)" not in workbook.sheetnames:
@@ -272,11 +287,190 @@ def _tool_target_rows(status_path: Path) -> list[dict[str, object]]:
             if not identity:
                 raise SchemaMismatch(f"대상자 합계행의 식별정보가 없습니다: {status_path.name}")
             rows.append(row)
-        if not rows:
+        if not rows and not allow_empty:
             raise SchemaMismatch(f"Tool에 적재할 대상자 합계행이 없습니다: {status_path.name}")
         return rows
     finally:
         workbook.close()
+
+
+def _copy_cell_format(source, target) -> None:
+    if source.has_style:
+        target._style = copy(source._style)
+    target.alignment = copy(source.alignment)
+    target.protection = copy(source.protection)
+
+
+def _tax_adjustment_allowances(workbook) -> list[tuple[str, str, str]]:
+    if ALLOWANCE_REGISTER_SHEET not in workbook.sheetnames:
+        raise SchemaMismatch(f"기초정보에 {ALLOWANCE_REGISTER_SHEET} 시트가 없습니다.")
+    sheet = workbook[ALLOWANCE_REGISTER_SHEET]
+    allowances: list[tuple[str, str, str]] = []
+    for row in range(4, sheet.max_row + 1):
+        name = str(sheet.cell(row, 1).value or "").strip()
+        if not name:
+            continue
+        allowances.append(
+            (
+                name,
+                str(sheet.cell(row, 4).value or "").strip(),
+                str(sheet.cell(row, 5).value or "").strip(),
+            )
+        )
+    adjustment = [item for item in allowances if item[0] == NON_TAX_OVERTIME_HEADER]
+    if len(adjustment) != 1:
+        raise SchemaMismatch(
+            f"기초정보 수당등록에 {NON_TAX_OVERTIME_HEADER} 항목이 {len(adjustment)}개입니다."
+        )
+    return [adjustment[0], *(item for item in allowances if item != adjustment[0])]
+
+
+def _amount(value: object) -> int | float:
+    number = _numeric_value(value)
+    if number is None:
+        return 0
+    return int(number) if number.is_integer() else number
+
+
+def _populate_tax_adjustment_sheet(
+    basic_info_path: Path,
+    status_files: tuple[Path, ...],
+) -> None:
+    path = Path(basic_info_path).resolve(strict=True)
+    workbook = load_workbook(path, data_only=False, read_only=False)
+    temporary = path.with_name(f".{path.stem}.{uuid4().hex}.tmp.xlsx")
+    try:
+        if TAX_ADJUSTMENT_SHEET not in workbook.sheetnames:
+            raise SchemaMismatch(f"기초정보에 {TAX_ADJUSTMENT_SHEET} 시트가 없습니다.")
+        sheet = workbook[TAX_ADJUSTMENT_SHEET]
+        allowances = _tax_adjustment_allowances(workbook)
+
+        existing_last_column = max(sheet.max_column, len(TAX_ADJUSTMENT_BASE_HEADERS))
+        existing_last_row = max(sheet.max_row, 5)
+        for row in range(5, existing_last_row + 1):
+            for column in range(1, existing_last_column + 1):
+                sheet.cell(row, column).value = None
+        for row in range(2, 5):
+            for column in range(8, existing_last_column + 1):
+                sheet.cell(row, column).value = None
+
+        for column, header in enumerate(TAX_ADJUSTMENT_BASE_HEADERS, start=1):
+            if column not in (3, 4, 5) or sheet.cell(4, column).value in (None, ""):
+                sheet.cell(4, column).value = header
+
+        dynamic_headers: list[str] = []
+        template_last_row = max(sheet.max_row, 182)
+        for offset, (name, detail, code) in enumerate(allowances, start=8):
+            for row in range(2, template_last_row + 1):
+                _copy_cell_format(sheet.cell(row, 7), sheet.cell(row, offset))
+            sheet.cell(2, offset).value = code
+            sheet.cell(3, offset).value = detail
+            sheet.cell(4, offset).value = name
+            sheet.column_dimensions[get_column_letter(offset)].width = min(
+                45,
+                max(12, len(name) * 1.2),
+            )
+            dynamic_headers.append(name)
+
+        adjustment_column = 8
+        overtime_total_column = next(
+            (
+                8 + index
+                for index, name in enumerate(dynamic_headers)
+                if "O01" in name.upper() and name.endswith("_총계")
+            ),
+            None,
+        )
+        overtime_current_column = next(
+            (
+                8 + index
+                for index, name in enumerate(dynamic_headers)
+                if "O01" in name.upper() and name.endswith("_현계")
+            ),
+            None,
+        )
+        if overtime_total_column is None or overtime_current_column is None:
+            detail = allowances[0][1]
+            code = allowances[0][2]
+            overtime_total_column = 8 + len(dynamic_headers)
+            overtime_current_column = overtime_total_column + 1
+            for column, suffix in (
+                (overtime_total_column, "총계"),
+                (overtime_current_column, "현계"),
+            ):
+                for row in range(2, template_last_row + 1):
+                    _copy_cell_format(sheet.cell(row, 7), sheet.cell(row, column))
+                sheet.cell(2, column).value = code
+                sheet.cell(3, column).value = detail
+                sheet.cell(4, column).value = f"{detail}({code})_{suffix}"
+
+        target_row = 5
+        seen_employees: set[tuple[int, str, str]] = set()
+        seen_indexes: set[tuple[int, str]] = set()
+        for status_path in sorted(status_files, key=_year_from_status):
+            year = _year_from_status(status_path)
+            for serial_number, record in enumerate(
+                _tool_target_rows(status_path, allow_empty=True),
+                start=1,
+            ):
+                employee_code = str(record.get("사원번호") or record.get("사번") or "").strip()
+                name = str(record.get("성명") or record.get("이름") or "").strip()
+                resident_id = format_resident_id(
+                    record.get("주민등록번호") or record.get("주민번호")
+                )
+                pdf_index = _tool_index_key(record.get("인덱스"))
+                resident_key = _resident_key(resident_id)
+                if not employee_code or not name or len(_digits(resident_id)) != 13 or not pdf_index:
+                    raise SchemaMismatch(
+                        f"수당조정 대상자의 사원번호·성명·주민번호·인덱스가 올바르지 않습니다: "
+                        f"{year}, {name or '(성명 없음)'}"
+                    )
+                employee_key = (year, employee_code, resident_key)
+                if employee_key in seen_employees:
+                    raise SchemaMismatch(
+                        f"수당조정 대상자가 중복되었습니다: {year}, {employee_code}, {name}"
+                    )
+                if (year, pdf_index) in seen_indexes:
+                    raise SchemaMismatch(f"수당조정 인덱스가 중복되었습니다: {year}, {pdf_index}")
+                seen_employees.add(employee_key)
+                seen_indexes.add((year, pdf_index))
+
+                adjustment = _amount(record.get(NON_TAX_OVERTIME_HEADER))
+                sheet.cell(target_row, 1).value = f"{year}년"
+                sheet.cell(target_row, 2).value = serial_number
+                sheet.cell(target_row, 3).value = employee_code
+                sheet.cell(target_row, 4).value = name
+                sheet.cell(target_row, 5).value = resident_id
+                sheet.cell(target_row, 6).value = pdf_index
+                sheet.cell(target_row, 7).value = -adjustment
+                sheet.cell(target_row, adjustment_column).value = adjustment
+                for index, header in enumerate(dynamic_headers[1:], start=9):
+                    sheet.cell(target_row, index).value = _amount(record.get(header))
+
+                previous_total = _amount(sheet.cell(target_row, overtime_total_column).value)
+                previous_current = _amount(sheet.cell(target_row, overtime_current_column).value)
+                sheet.cell(target_row, overtime_total_column).value = (
+                    previous_total - previous_current + adjustment
+                )
+                sheet.cell(target_row, overtime_current_column).value = adjustment
+                for column in range(1, max(sheet.max_column, overtime_current_column) + 1):
+                    _copy_cell_format(
+                        sheet.cell(target_row, min(column, 7)),
+                        sheet.cell(target_row, column),
+                    )
+                for column in (3, 5, 6):
+                    sheet.cell(target_row, column).number_format = "@"
+                for column in range(7, max(sheet.max_column, overtime_current_column) + 1):
+                    sheet.cell(target_row, column).number_format = MONEY_FORMAT
+                target_row += 1
+
+        workbook.calculation.fullCalcOnLoad = True
+        workbook.calculation.forceFullCalc = True
+        workbook.save(temporary)
+        os.replace(temporary, path)
+    finally:
+        workbook.close()
+        temporary.unlink(missing_ok=True)
 
 
 def _formula_text(value: object) -> str | None:
@@ -742,18 +936,35 @@ def prepare_correction_inputs(
         for status_path in sorted(payroll_status_files, key=_year_from_status):
             source = Path(status_path).resolve(strict=True)
             year = _year_from_status(source)
-            logger.info("%d년 급상여현황(수정) 생성 시작", year)
-            years.append(year)
             modified = modified_root / safe_name(
                 f"{company_name}_{str(year)[-2:]}년 급상여현황(수정).xlsx"
             )
+            tool = modified_root / safe_name(
+                f"{company_name}_{str(year)[-2:]}년 수정 원천징수영수증 생성 Tool.xlsx"
+            )
+            if not _tool_target_rows(source, allow_empty=True):
+                modified.unlink(missing_ok=True)
+                tool.unlink(missing_ok=True)
+                for month in range(1, 13):
+                    stale_monthly = correction_root / safe_name(
+                        f"{company_name}_{str(year)[-2:]}년{month:02d}월_급여대장.xls"
+                    )
+                    stale_monthly.unlink(missing_ok=True)
+                issues.append(
+                    {
+                        "year": year,
+                        "type": "대상자 없음",
+                        "detail": "대상자 합계행 0개로 수정신고 입력자료 생성 제외",
+                    }
+                )
+                logger.info("%d년 수정신고 입력자료 생성 제외: 대상자 합계행 0개", year)
+                continue
+            logger.info("%d년 급상여현황(수정) 생성 시작", year)
+            years.append(year)
             snapshot_file(source, modified)
             modified_files.append(modified)
             logger.info("%d년 급상여현황(수정) 생성 완료: %s", year, modified)
 
-            tool = modified_root / safe_name(
-                f"{company_name}_{str(year)[-2:]}년 수정 원천징수영수증 생성 Tool.xlsx"
-            )
             snapshot_file(template, tool)
             _populate_withholding_tool_data(
                 tool_path=tool,
@@ -782,6 +993,7 @@ def prepare_correction_inputs(
         if tool_jobs:
             (tool_populator or _populate_tools_with_pdf_images)(tool_jobs)
         converter(conversions)
+        _populate_tax_adjustment_sheet(basic_info, tuple(modified_files))
     except Exception:
         for path in (*modified_files, *tool_files, *monthly_files):
             path.unlink(missing_ok=True)

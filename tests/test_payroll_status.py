@@ -6,6 +6,7 @@ from payroll_amendment.payroll_status import (
     AutomaticItemRules,
     ItemDecision,
     _ordered_status_headers,
+    _reviewed_item_categories,
     _requires_regularity_check,
     _write_sheet,
     generate_payroll_status_files,
@@ -20,6 +21,7 @@ def _make_rules(path: Path) -> None:
     direct.append(["WEHAGO 항목명", "표준 항목명", "판정구분"])
     direct.append(["기본급", "기본급", "정액급여"])
     direct.append(["연장수당", "연장수당", "수당검토"])
+    direct.append(["직무수당", "직무수당", "제외"])
     keywords = book.create_sheet("자동판단키워드")
     keywords.append(["키워드", "판정구분"])
     keywords.append(["연장", "수당검토"])
@@ -91,7 +93,7 @@ def _make_payroll(
         date_headers = ["입사일", "퇴사일"] if employment_dates else []
         date_values = list(employment_dates) if employment_dates else []
         sheet.append(["사원번호", "성명", "주민등록번호", *date_headers, "급여구분", "기본급", "연장수당", "기타수당", "지급합계", "소득세", "공제합계", "차인지급액"])
-        sheet.append(["001", "홍길동", "", *date_values, "급여", 2_000_000, 100_000, unknown_amount, 2_100_000 + unknown_amount, 10_000, 10_000, 2_090_000 + unknown_amount])
+        sheet.append(["001", "홍길동", "9001011234567", *date_values, "급여", 2_000_000, 100_000, unknown_amount, 2_100_000 + unknown_amount, 10_000, 10_000, 2_090_000 + unknown_amount])
         if include_unknown_employee:
             sheet.append(["002", "미연결", "", "급여", 2_000_000, 0, 0, 2_000_000, 0, 0, 2_000_000])
     book.save(path)
@@ -105,7 +107,74 @@ def test_item_rules_precedence(tmp_path):
     assert rules.classify("연장수당").category == "수당검토"
     assert rules.classify("특별상여").category == "제외"
     assert rules.classify("식대보조금").category == "정액급여"
+    assert rules.classify("직책보조수당").category == "정액급여"
+    assert rules.classify("직무수당").category == "정액급여"
+    assert rules.classify("근무외수당").category == "수당검토"
     assert rules.classify("현장수당").category == "미분류"
+
+
+def test_reviewed_basic_info_markers_override_automatic_rules(tmp_path):
+    rules_path = tmp_path / "rules.xlsx"
+    basic_path = tmp_path / "테스트_기초정보.xlsx"
+    payroll_directory = tmp_path / "payroll"
+    output_directory = tmp_path / "output"
+    payroll_directory.mkdir()
+    _make_rules(rules_path)
+    _make_basic(basic_path)
+    payroll_path = payroll_directory / "테스트_23년 급여대장.xlsx"
+    _make_payroll(payroll_path, unknown_amount=100_000)
+
+    basic = load_workbook(basic_path)
+    sheet = basic["사업장정보"]
+    sheet["J6"] = "기타수당"
+    sheet["K6"] = "O"
+    basic.save(basic_path)
+    basic.close()
+
+    result = generate_payroll_status_files(
+        company_name="테스트",
+        basic_info_path=basic_path,
+        payroll_directory=payroll_directory,
+        item_rules_path=rules_path,
+        output_directory=output_directory,
+        use_reviewed_item_markers=True,
+    )
+
+    status = load_workbook(result.output_files[0], read_only=True, data_only=True)
+    headers = [cell.value for cell in status["전체인원"][1]]
+    first = dict(zip(headers, next(status["전체인원"].iter_rows(min_row=2, values_only=True))))
+    status.close()
+    assert first["정액급여합계"] == 100_000
+
+
+def test_reviewed_item_categories_reads_rows_in_one_pass(tmp_path, monkeypatch):
+    basic_path = tmp_path / "기초정보.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "사업장정보"
+    sheet["J5"] = "기본급"
+    sheet["K5"] = "O"
+    sheet["P5"] = "연장수당"
+    sheet["R5"] = "O"
+    sheet["S5"] = "2024"
+    workbook.save(basic_path)
+    workbook.close()
+
+    workbook = load_workbook(basic_path, read_only=True, data_only=True)
+    sheet_type = type(workbook["사업장정보"])
+
+    def reject_random_cell_access(*_args, **_kwargs):
+        raise AssertionError("read_only 시트에서 반복 cell() 접근을 사용하면 안 됩니다.")
+
+    monkeypatch.setattr(sheet_type, "cell", reject_random_cell_access)
+    try:
+        assert _reviewed_item_categories(workbook, 2023) == {"기본급": "정액급여"}
+        assert _reviewed_item_categories(workbook, 2024) == {
+            "기본급": "정액급여",
+            "연장수당": "수당검토",
+        }
+    finally:
+        workbook.close()
 
 
 def test_status_payment_headers_are_ordered_by_category():
@@ -538,7 +607,7 @@ def test_generates_status_and_updates_detected_years(tmp_path, caplog):
     status_book.close()
 
 
-def test_same_name_tax_records_match_annual_rows_by_employee_code(tmp_path):
+def test_same_name_tax_records_match_annual_rows_by_resident_and_name(tmp_path):
     basic = tmp_path / "테스트_기초정보.xlsx"
     payroll = tmp_path / "payroll"
     output = tmp_path / "output"
@@ -560,8 +629,8 @@ def test_same_name_tax_records_match_annual_rows_by_employee_code(tmp_path):
             "사원번호", "성명", "주민등록번호", "급여구분", "기본급", "연장수당",
             "지급합계", "소득세", "공제합계", "차인지급액",
         ])
-        sheet.append(["9001011234567", "홍길동", "", "급여", 2_000_000, 100_000, 2_100_000, 10_000, 10_000, 2_090_000])
-        sheet.append(["9101011234567", "홍길동", "", "급여", 3_000_000, 100_000, 3_100_000, 20_000, 20_000, 3_080_000])
+        sheet.append(["001", "홍길동", "9001011234567", "급여", 2_000_000, 100_000, 2_100_000, 10_000, 10_000, 2_090_000])
+        sheet.append(["002", "홍길동", "9101011234567", "급여", 3_000_000, 100_000, 3_100_000, 20_000, 20_000, 3_080_000])
     payroll_book.save(payroll / "테스트_23년 급여대장.xlsx")
     payroll_book.close()
 
@@ -582,16 +651,61 @@ def test_same_name_tax_records_match_annual_rows_by_employee_code(tmp_path):
             for row in sheet.iter_rows(min_row=2, values_only=True)
             if str(row[headers.index("지급년월")] or "").endswith("년합계")
         }
-        assert annual_rows["9001011234567"]["주민등록번호"] == "900101-1234567"
-        assert annual_rows["9101011234567"]["주민등록번호"] == "910101-1234567"
-        assert annual_rows["9001011234567"]["인덱스"] == "1"
-        assert annual_rows["9101011234567"]["인덱스"] == "2"
-        assert annual_rows["9001011234567"]["근로소득"] == 550_000
-        assert annual_rows["9101011234567"]["근로소득"] == 650_000
-        assert annual_rows["9001011234567"]["결정세액_소득세"] == 100_000
-        assert annual_rows["9101011234567"]["결정세액_소득세"] == 200_000
+        assert annual_rows["900101-1234567"]["주민등록번호"] == "900101-1234567"
+        assert annual_rows["910101-1234567"]["주민등록번호"] == "910101-1234567"
+        assert annual_rows["900101-1234567"]["인덱스"] == "1"
+        assert annual_rows["910101-1234567"]["인덱스"] == "2"
+        assert annual_rows["900101-1234567"]["근로소득"] == 550_000
+        assert annual_rows["910101-1234567"]["근로소득"] == 650_000
+        assert annual_rows["900101-1234567"]["결정세액_소득세"] == 100_000
+        assert annual_rows["910101-1234567"]["결정세액_소득세"] == 200_000
     finally:
         status.close()
+
+
+def test_unique_name_without_resident_number_is_not_matched(tmp_path):
+    basic = tmp_path / "테스트_기초정보.xlsx"
+    payroll = tmp_path / "payroll"
+    output = tmp_path / "output"
+    rules = tmp_path / "rules.xlsx"
+    payroll.mkdir()
+    _make_basic(basic)
+    _make_rules(rules)
+    payroll_path = payroll / "테스트_23년 급여대장.xlsx"
+    _make_payroll(payroll_path)
+    payroll_book = load_workbook(payroll_path)
+    try:
+        for sheet in payroll_book.worksheets:
+            sheet.cell(2, 3).value = None
+        payroll_book.save(payroll_path)
+    finally:
+        payroll_book.close()
+
+    result = generate_payroll_status_files(
+        company_name="테스트",
+        basic_info_path=basic,
+        payroll_directory=payroll,
+        item_rules_path=rules,
+        output_directory=output,
+    )
+
+    status = load_workbook(output / "테스트_23년 급상여현황.xlsx", read_only=True, data_only=True)
+    try:
+        assert status["대상자"].max_row == 1
+        annual = next(
+            row
+            for row in status["비대상자"].iter_rows(min_row=2, values_only=True)
+            if str(row[5]).endswith("년합계")
+        )
+        headers = [cell.value for cell in status["비대상자"][1]]
+        values = dict(zip(headers, annual))
+        assert values["주민등록번호"] is None
+        assert values["인덱스"] is None
+    finally:
+        status.close()
+    assert "원천징수 자료 주민번호·성명 미연결" in result.report_path.read_text(
+        encoding="utf-8-sig"
+    )
 
 
 def test_duplicate_tax_records_for_same_identity_are_excluded(tmp_path):
@@ -681,7 +795,7 @@ def test_resident_mismatch_does_not_fall_back_to_same_name(tmp_path):
     assert "원천징수 자료 주민번호·성명 미연결" in result.report_path.read_text(encoding="utf-8-sig")
 
 
-def test_rehire_split_across_employee_codes_is_excluded(tmp_path):
+def test_rehire_split_across_employee_codes_is_merged_by_resident_id(tmp_path):
     basic = tmp_path / "테스트_기초정보.xlsx"
     payroll = tmp_path / "payroll"
     output = tmp_path / "output"
@@ -693,11 +807,10 @@ def test_rehire_split_across_employee_codes_is_excluded(tmp_path):
     _make_payroll(payroll_path)
     payroll_book = load_workbook(payroll_path)
     try:
-        for sheet in payroll_book.worksheets:
-            sheet.cell(2, 3, "9001011234567")
-            second = [cell.value for cell in sheet[2]]
-            second[0] = "002"
-            sheet.append(second)
+        for month, sheet in enumerate(payroll_book.worksheets, 1):
+            sheet.cell(2, 3, None if month == 1 else "9001011234567")
+            if month >= 7:
+                sheet.cell(2, 1, "002")
         payroll_book.save(payroll_path)
     finally:
         payroll_book.close()
@@ -712,12 +825,13 @@ def test_rehire_split_across_employee_codes_is_excluded(tmp_path):
 
     status = load_workbook(output / "테스트_23년 급상여현황.xlsx", read_only=True, data_only=True)
     try:
-        assert status["대상자"].max_row == 1
-        non_target_codes = {row[0] for row in status["비대상자"].iter_rows(min_row=2, values_only=True)}
-        assert non_target_codes == {"001", "002"}
+        target = status["대상자"]
+        assert target.max_row == 14
+        target_codes = {row[0] for row in target.iter_rows(min_row=2, values_only=True)}
+        assert target_codes == {"900101-1234567"}
     finally:
         status.close()
-    assert "동일 주민번호·성명이 복수 사원번호로 분리됨" in result.report_path.read_text(encoding="utf-8-sig")
+    assert "동일 주민번호·성명이 복수 사원번호로 분리됨" not in result.report_path.read_text(encoding="utf-8-sig")
 
 
 def test_explicit_non_target_occupation_is_excluded_and_blank_is_provisionally_eligible(tmp_path):
@@ -871,6 +985,54 @@ def test_zero_pension_and_health_insurance_excludes_only_that_month(tmp_path):
         book.close()
 
 
+def test_formula_named_insurance_columns_are_used_for_target_selection(tmp_path):
+    basic = tmp_path / "테스트_기초정보.xlsx"
+    payroll = tmp_path / "payroll"
+    output = tmp_path / "output"
+    rules = tmp_path / "rules.xlsx"
+    payroll.mkdir()
+    _make_basic(basic)
+    _make_rules(rules)
+    payroll_path = payroll / "테스트_23년 급여대장.xlsx"
+    _make_payroll(payroll_path)
+
+    payroll_book = load_workbook(payroll_path)
+    try:
+        for sheet in payroll_book.worksheets:
+            sheet.insert_cols(10, 4)
+            sheet.cell(1, 10, "국민연금")
+            sheet.cell(1, 11, "건강보험")
+            sheet.cell(1, 12, "국민연금(보수월액*4.5%)")
+            sheet.cell(1, 13, "건강보험료(보수월액*3.545%)")
+            sheet.cell(2, 10, 0)
+            sheet.cell(2, 11, 0)
+            sheet.cell(2, 12, 100_000)
+            sheet.cell(2, 13, 100_000)
+            sheet.cell(2, 14, 210_000)
+            sheet.cell(2, 15, 1_890_000)
+        payroll_book.save(payroll_path)
+    finally:
+        payroll_book.close()
+
+    generate_payroll_status_files(
+        company_name="테스트",
+        basic_info_path=basic,
+        payroll_directory=payroll,
+        item_rules_path=rules,
+        output_directory=output,
+    )
+
+    book = load_workbook(output / "테스트_23년 급상여현황.xlsx", data_only=True, read_only=True)
+    try:
+        target_names = {
+            row[1]
+            for row in book["대상자(작업)"].iter_rows(min_row=2, values_only=True)
+        }
+        assert "홍길동" in target_names
+    finally:
+        book.close()
+
+
 def test_unmatched_employee_is_non_target_and_reported(tmp_path):
     basic = tmp_path / "테스트_기초정보.xlsx"
     payroll = tmp_path / "payroll"
@@ -890,7 +1052,7 @@ def test_unmatched_employee_is_non_target_and_reported(tmp_path):
     )
 
     report = result.report_path.read_text(encoding="utf-8-sig")
-    assert "원천징수 자료 미연결" in report
+    assert "원천징수 자료 주민번호·성명 미연결" in report
     book = load_workbook(output / "테스트_23년 급상여현황.xlsx", data_only=True, read_only=True)
     non_target_names = {row[1] for row in book["비대상자"].iter_rows(min_row=2, values_only=True)}
     assert "미연결" in non_target_names

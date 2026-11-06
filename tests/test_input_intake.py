@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import re
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import Workbook
 
@@ -14,6 +16,16 @@ def _make_payroll(path: Path) -> None:
     sheet.append(["성명", "사원번호", "기본급", "지급합계"])
     sheet.append(["홍길동", "001", 2_000_000, 2_000_000])
     book.save(path)
+
+
+def _remove_worksheet_dimension(path: Path) -> None:
+    with ZipFile(path) as archive:
+        contents = {name: archive.read(name) for name in archive.namelist()}
+    worksheet = "xl/worksheets/sheet1.xml"
+    contents[worksheet] = re.sub(br"<dimension[^>]*/>", b"", contents[worksheet], count=1)
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in contents.items():
+            archive.writestr(name, content)
 
 
 def test_organizes_single_company_batch(tmp_path):
@@ -36,7 +48,7 @@ def test_organizes_single_company_batch(tmp_path):
         company_metadata_reader=lambda _: ("주식회사 테스트", "123-45-67890"),
     )
 
-    company = project / "노무_세무 수정신고" / "주식회사 테스트"
+    company = project / "노무_세무 수정신고" / "테스트"
     assert result.company_directory == company
     assert (company / "1. 급상여현황 생성" / "1.Input" / "원천징수영수증" / receipt.name).is_file()
     assert (company / "1. 급상여현황 생성" / "1.Input" / "급여대장" / payroll.name).is_file()
@@ -44,7 +56,29 @@ def test_organizes_single_company_batch(tmp_path):
     assert (company / health.name).is_file()
     report = json.loads(result.report_path.read_text(encoding="utf-8-sig"))
     assert report["status"] == "SUCCEEDED"
+    assert report["company_aliases"] == ["주식회사 테스트"]
     assert len(report["moved_files"]) == 4
+
+
+def test_organizes_payroll_without_worksheet_dimension(tmp_path):
+    project = tmp_path / "project"
+    inbox = project / "input"
+    inbox.mkdir(parents=True)
+    receipt = inbox / "25년 원천징수영수증.pdf"
+    receipt.write_bytes(b"test receipt")
+    payroll = inbox / "25년 1월 급여대장.xlsx"
+    _make_payroll(payroll)
+    _remove_worksheet_dimension(payroll)
+
+    result = organize_input_batch(
+        input_directory=inbox,
+        project_root=project,
+        pdf_classifier=lambda _: "withholding_receipt",
+        company_metadata_reader=lambda _: ("주식회사 테스트", "123-45-67890"),
+    )
+
+    assert payroll.name in {path.name for path in result.moved_files}
+    assert not result.unknown_files
 
 
 def test_moves_occupation_mapping_result_to_company_directory(tmp_path):
@@ -63,10 +97,62 @@ def test_moves_occupation_mapping_result_to_company_directory(tmp_path):
         company_metadata_reader=lambda _: ("에스씨케이(주)", "123-45-67890"),
     )
 
-    destination = project / "노무_세무 수정신고" / "에스씨케이(주)" / employment.name
+    destination = project / "노무_세무 수정신고" / "SCK" / employment.name
     assert destination.is_file()
     assert destination in result.moved_files
     assert not result.unknown_files
+
+
+def test_allows_pdf_company_aliases_with_same_business_id(tmp_path):
+    project = tmp_path / "project"
+    inbox = project / "input"
+    inbox.mkdir(parents=True)
+    old_receipt = inbox / "23년 원천징수영수증.pdf"
+    new_receipt = inbox / "24년 원천징수영수증.pdf"
+    old_receipt.write_bytes(b"old receipt")
+    new_receipt.write_bytes(b"new receipt")
+    employment = inbox / "연합시큐리티_근로자고용정보현황조회.xlsx"
+    employment.write_bytes(b"employment")
+    health = inbox / "연합시큐리티_사업장가입자명부.xlsx"
+    health.write_bytes(b"health")
+
+    metadata = {
+        old_receipt: ("주식회사코드원에스에스(CODEONESS)", "301-86-16563"),
+        new_receipt: ("연합시큐리티", "301-86-16563"),
+    }
+    result = organize_input_batch(
+        input_directory=inbox,
+        project_root=project,
+        pdf_classifier=lambda _: "withholding_receipt",
+        company_metadata_reader=metadata.__getitem__,
+    )
+
+    assert result.company_name == "연합시큐리티"
+    assert result.company_directory.name == "연합시큐리티"
+    report = json.loads(result.report_path.read_text(encoding="utf-8-sig"))
+    assert report["company_aliases"] == ["주식회사코드원에스에스(CODEONESS)"]
+
+
+def test_rejects_conflicting_current_company_names(tmp_path):
+    project = tmp_path / "project"
+    inbox = project / "input"
+    inbox.mkdir(parents=True)
+    receipt = inbox / "25년 원천징수영수증.pdf"
+    receipt.write_bytes(b"receipt")
+    (inbox / "연합시큐리티_근로자고용정보현황조회.xlsx").write_bytes(b"employment")
+    (inbox / "코드원에스에스_사업장가입자명부.xlsx").write_bytes(b"health")
+
+    try:
+        organize_input_batch(
+            input_directory=inbox,
+            project_root=project,
+            pdf_classifier=lambda _: "withholding_receipt",
+            company_metadata_reader=lambda _: ("과거상호", "301-86-16563"),
+        )
+    except SchemaMismatch as exc:
+        assert "현재 상호가 다릅니다" in str(exc)
+    else:
+        raise AssertionError("고용정보와 사업장가입자명부의 현재 상호가 다르면 중단해야 합니다.")
 
 
 def test_existing_destination_blocks_all_moves(tmp_path):

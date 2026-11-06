@@ -8,12 +8,22 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
+from .amended_withholding import AmendedWithholdingResult, generate_company_amended_withholding
 from .correction_inputs import CorrectionInputResult, prepare_correction_inputs
 from .employee_info import discover_employee_info_sources, populate_basic_info_employee_sheets
 from .errors import SchemaMismatch
 from .input_intake import IntakeResult, organize_input_batch
 from .payroll_converter import PayrollConverter, UniversalConversionResult
-from .payroll_status import PayrollStatusResult, generate_company_payroll_status
+from .payroll_status import (
+    BasicInfoPreparationResult,
+    PayrollStatusResult,
+    generate_company_payroll_status,
+    prepare_company_basic_info_for_review,
+)
+from .submission_target_lists import (
+    SubmissionTargetListResult,
+    generate_company_submission_target_lists,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -28,6 +38,28 @@ class FullPipelineResult:
     payroll_files: tuple[Path, ...]
     report_path: Path
     correction_inputs: CorrectionInputResult
+    amended_withholding: AmendedWithholdingResult | None
+    submission_targets: SubmissionTargetListResult
+
+
+@dataclass(frozen=True)
+class BasicInfoReviewResult:
+    intake: IntakeResult
+    conversion: UniversalConversionResult
+    preparation: BasicInfoPreparationResult
+    basic_info_path: Path
+    payroll_files: tuple[Path, ...]
+    report_path: Path
+
+
+def _write_json_report(path: Path, report: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8-sig")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _load_existing_intake(
@@ -62,11 +94,14 @@ def run_full_pipeline(
     input_directory: Path | None = None,
     existing_company_directory: Path | None = None,
     start_stage: int = 1,
-) -> FullPipelineResult:
-    if start_stage not in (1, 3):
-        raise ValueError("start_stage는 1 또는 3이어야 합니다.")
-    if start_stage == 3 and existing_company_directory is None:
-        raise ValueError("3단계 재개에는 existing_company_directory가 필요합니다.")
+    review_completed: bool = False,
+) -> FullPipelineResult | BasicInfoReviewResult:
+    if start_stage not in (1, 3, 5):
+        raise ValueError("start_stage는 1, 3 또는 5여야 합니다.")
+    if start_stage in (3, 5) and existing_company_directory is None:
+        raise ValueError(f"{start_stage}단계 재개에는 existing_company_directory가 필요합니다.")
+    if start_stage == 5 and not review_completed:
+        raise ValueError("5단계 재개에는 기초정보 사람 검토 완료 확인이 필요합니다.")
 
     root = Path(project_root).resolve(strict=True)
     resources = root / "Resources"
@@ -83,26 +118,27 @@ def run_full_pipeline(
 
     if existing_company_directory is None:
         input_root = Path(input_directory or root / "input").resolve(strict=True)
-        logger.info("전체 실행 [1/7] 입력 접수 및 거래처 폴더 생성 시작")
+        logger.info("전체 실행 [1/8] 입력 접수 및 거래처 폴더 생성 시작")
         intake = organize_input_batch(input_directory=input_root, project_root=root)
-        logger.info("전체 실행 [1/7] 완료: %s", intake.company_name)
+        logger.info("전체 실행 [1/8] 완료: %s", intake.company_name)
     else:
-        logger.info("전체 실행 [1/7] 기존 입력 재개 시작")
+        logger.info("전체 실행 [1/8] 기존 입력 재개 시작")
         intake = _load_existing_intake(
             existing_company_directory,
             validate_moved_files=start_stage == 1,
         )
-        logger.info("전체 실행 [1/7] 기존 입력 재개 완료: %s", intake.company_name)
+        logger.info("전체 실행 [1/8] 기존 입력 재개 완료: %s", intake.company_name)
     company_root = intake.company_directory
     if start_stage == 1:
         source_input = company_root / "1. 급상여현황 생성" / "1.Input"
-        logger.info("전체 실행 [2/7] 원천징수 분할·추출 및 기초정보·급여대장 생성 시작")
+        logger.info("전체 실행 [2/8] 원천징수 분할·추출 및 기초정보·급여대장 생성 시작")
         conversion = PayrollConverter().convert_company_input(
             input_root=source_input,
             output_directory=company_root,
             basic_info_template=template,
+            company_name=intake.company_name,
         )
-        logger.info("전체 실행 [2/7] 완료: 엑셀 %d개", len(conversion.output_files))
+        logger.info("전체 실행 [2/8] 완료: 엑셀 %d개", len(conversion.output_files))
         basic_files = [
             path for path in conversion.output_files
             if path.name.endswith("_기초정보.xlsx")
@@ -112,7 +148,7 @@ def run_full_pipeline(
             if path.name.endswith("년 급여대장.xlsx")
         ]
     else:
-        logger.info("전체 실행 [1/7~2/7] 기존 산출물 재사용")
+        logger.info("전체 실행 [1/8~2/8] 기존 산출물 재사용")
         basic_files = sorted(
             path for path in company_root.glob("*_기초정보.xlsx")
             if not path.name.startswith("~$")
@@ -135,41 +171,44 @@ def run_full_pipeline(
         raise SchemaMismatch(f"연도별 급여대장 결과가 없습니다: {company_root}")
 
     basic_info = basic_files[0]
-    logger.info("전체 실행 [3/7] 직업분류코드 및 건보정보 적재 시작")
-    employment_info, health_roster = discover_employee_info_sources(company_root)
-    if start_stage == 3 and (
-        employment_info is None or "직업분류매핑결과" not in employment_info.name
-    ):
-        raise SchemaMismatch(
-            f"파일명에 '직업분류매핑결과'가 포함된 엑셀 파일이 없습니다: {company_root}"
+    if start_stage != 5:
+        logger.info("전체 실행 [3/8] 직업분류코드 및 건보정보 적재 시작")
+        employment_info, health_roster = discover_employee_info_sources(company_root)
+        if start_stage == 3 and (
+            employment_info is None or "직업분류매핑결과" not in employment_info.name
+        ):
+            raise SchemaMismatch(
+                f"파일명에 '직업분류매핑결과'가 포함된 엑셀 파일이 없습니다: {company_root}"
+            )
+        employee_info = populate_basic_info_employee_sheets(
+            basic_info_path=basic_info,
+            employment_info_path=employment_info,
+            health_roster_path=health_roster,
+            occupation_linkage_path=resources / "직업분류_연계표.xlsx",
         )
-    employee_info = populate_basic_info_employee_sheets(
-        basic_info_path=basic_info,
-        employment_info_path=employment_info,
-        health_roster_path=health_roster,
-        occupation_linkage_path=resources / "직업분류_연계표.xlsx",
-    )
-    logger.info(
-        "전체 실행 [3/7] 완료: 직업분류 입력=%s, 매핑완료=%d, 수동확인=%d",
-        employee_info.employment_source,
-        employee_info.mapped_rows,
-        employee_info.manual_review_rows,
-    )
+        logger.info(
+            "전체 실행 [3/8] 완료: 직업분류 입력=%s, 매핑완료=%d, 수동확인=%d",
+            employee_info.employment_source,
+            employee_info.mapped_rows,
+            employee_info.manual_review_rows,
+        )
+    else:
+        logger.info("전체 실행 [1/8~4/8] 사람 검토 완료 기초정보·기존 급여대장 재사용")
 
     payroll_input = company_root / "2.근로소득 수정신고" / "1.Input"
     payroll_input.mkdir(parents=True, exist_ok=True)
     payroll_files: list[Path] = []
     if payroll_outputs:
-        logger.info("전체 실행 [4/7] 파일 이동 시작 (총 %d개)", len(payroll_outputs))
+        logger.info("전체 실행 [4/8] 파일 이동 시작 (총 %d개)", len(payroll_outputs))
         try:
             for source in payroll_outputs:
                 destination = payroll_input / source.name
                 os.replace(source, destination)
                 payroll_files.append(destination)
         except Exception as exc:
-            logger.error("전체 실행 [4/7] 파일 이동 오류: %s", exc)
+            logger.error("전체 실행 [4/8] 파일 이동 오류: %s", exc)
             raise
-        logger.info("전체 실행 [4/7] 파일 이동 완료: %d개", len(payroll_files))
+        logger.info("전체 실행 [4/8] 파일 이동 완료: %d개", len(payroll_files))
     else:
         payroll_files = sorted(
             path for path in payroll_input.glob("*년 급여대장.xlsx")
@@ -177,13 +216,50 @@ def run_full_pipeline(
         )
         if not payroll_files:
             raise SchemaMismatch(f"기존 연도별 급여대장이 없습니다: {payroll_input}")
-        logger.info("전체 실행 [4/7] 기존 급여대장 재사용: %d개", len(payroll_files))
+        logger.info("전체 실행 [4/8] 기존 급여대장 재사용: %d개", len(payroll_files))
 
-    logger.info("전체 실행 [5/7] 급상여현황 생성 시작")
-    payroll_status = generate_company_payroll_status(company_root, resources)
-    logger.info("전체 실행 [5/7] 완료: %d개", len(payroll_status.output_files))
+    review_report_path = company_root / "1. 급상여현황 생성" / "기초정보_검토대기.json"
+    if start_stage in (1, 3):
+        preparation = prepare_company_basic_info_for_review(company_root, resources)
+        review_report = {
+            "status": "AWAITING_HUMAN_REVIEW",
+            "prepared_at": datetime.now().astimezone().isoformat(),
+            "company_name": intake.company_name,
+            "company_directory": str(company_root),
+            "basic_info": str(basic_info),
+            "payroll_files": [str(path) for path in payroll_files],
+            "years": list(preparation.years),
+            "fixed_salary_items": preparation.fixed_count,
+            "review_allowance_items": preparation.review_count,
+            "next_start_stage": 5,
+        }
+        _write_json_report(review_report_path, review_report)
+        logger.info("기초정보 사람 검토 대기: %s", basic_info)
+        return BasicInfoReviewResult(
+            intake,
+            conversion,
+            preparation,
+            basic_info,
+            tuple(payroll_files),
+            review_report_path,
+        )
 
-    logger.info("전체 실행 [6/7] 수정신고 입력자료 생성 시작 (총 %d개 연도)", len(payroll_status.years))
+    if not review_report_path.is_file():
+        raise SchemaMismatch(f"기초정보 검토 대기 보고서가 없습니다: {review_report_path}")
+    review_report = json.loads(review_report_path.read_text(encoding="utf-8-sig"))
+    review_report["status"] = "HUMAN_REVIEW_COMPLETED"
+    review_report["review_completed_at"] = datetime.now().astimezone().isoformat()
+    _write_json_report(review_report_path, review_report)
+
+    logger.info("전체 실행 [5/8] 급상여현황 생성 시작")
+    payroll_status = generate_company_payroll_status(
+        company_root,
+        resources,
+        use_reviewed_item_markers=True,
+    )
+    logger.info("전체 실행 [5/8] 완료: %d개", len(payroll_status.output_files))
+
+    logger.info("전체 실행 [6/8] 수정신고 입력자료 생성 시작 (총 %d개 연도)", len(payroll_status.years))
     correction_inputs = prepare_correction_inputs(
         company_name=intake.company_name,
         basic_info_path=basic_info,
@@ -195,10 +271,30 @@ def run_full_pipeline(
         withholding_pdf_root=company_root / "1. 급상여현황 생성" / "원천징수(PDF)",
     )
     logger.info(
-        "전체 실행 [6/7] 수정신고 입력자료 생성 완료: 수정 급상여현황 %d개, Tool %d개, 월별 급여대장 %d개",
+        "전체 실행 [6/8] 수정신고 입력자료 생성 완료: 수정 급상여현황 %d개, Tool %d개, 월별 급여대장 %d개",
         len(correction_inputs.modified_status_files),
         len(correction_inputs.withholding_tool_files),
         len(correction_inputs.monthly_payroll_files),
+    )
+    amended_withholding = None
+    if correction_inputs.withholding_tool_files:
+        logger.info("전체 실행 [6/8] 수정후·변경표시 원천징수 PDF 생성 시작")
+        amended_withholding = generate_company_amended_withholding(company_root)
+        normal_count = len(amended_withholding.normal_files)
+        marked_count = len(amended_withholding.marked_files)
+        logger.info(
+            "전체 실행 [6/8] 수정 원천징수 PDF 생성 완료: 총 %d개 (수정후 %d개, 변경표시 %d개, 이미지 PDF 제외 %d개)",
+            normal_count + marked_count,
+            normal_count,
+            marked_count,
+            amended_withholding.excluded_image_pdfs,
+        )
+    logger.info("전체 실행 [7/8] 국세청·공단 제출자료 생성 시작")
+    submission_targets = generate_company_submission_target_lists(company_root)
+    logger.info(
+        "전체 실행 [7/8] 국세청·공단 제출자료 생성 완료: 국세청 %d개, 공단 %d개",
+        len(submission_targets.nts_files),
+        len(submission_targets.insurance_files),
     )
     report = {
         "completed_at": datetime.now().astimezone().isoformat(),
@@ -216,15 +312,28 @@ def run_full_pipeline(
         "withholding_tool_files": [str(path) for path in correction_inputs.withholding_tool_files],
         "monthly_payroll_files": [str(path) for path in correction_inputs.monthly_payroll_files],
         "correction_input_issues": list(correction_inputs.issues),
+        "amended_withholding_files": (
+            [str(path) for path in amended_withholding.normal_files]
+            if amended_withholding else []
+        ),
+        "marked_withholding_files": (
+            [str(path) for path in amended_withholding.marked_files]
+            if amended_withholding else []
+        ),
+        "amended_withholding_report": (
+            str(amended_withholding.report_path) if amended_withholding else None
+        ),
+        "submission_years": list(submission_targets.years),
+        "nts_submission_files": [str(path) for path in submission_targets.nts_files],
+        "insurance_submission_files": [
+            str(path) for path in submission_targets.insurance_files
+        ],
+        "submission_report": str(submission_targets.report_path),
+        "submission_issues": list(submission_targets.issues),
     }
     report_path = company_root / "1. 급상여현황 생성" / "전체실행_결과.json"
-    temporary = report_path.with_name(f".{report_path.name}.{uuid4().hex}.tmp")
-    try:
-        temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8-sig")
-        os.replace(temporary, report_path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    logger.info("전체 실행 [7/7] 결과 보고서 저장 완료: %s", report_path)
+    _write_json_report(report_path, report)
+    logger.info("전체 실행 [8/8] 결과 보고서 저장 완료: %s", report_path)
     return FullPipelineResult(
         intake,
         conversion,
@@ -233,4 +342,6 @@ def run_full_pipeline(
         tuple(payroll_files),
         report_path,
         correction_inputs,
+        amended_withholding,
+        submission_targets,
     )
